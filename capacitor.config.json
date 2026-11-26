@@ -1,0 +1,6 @@
+{
+  "appId": "com.monolens.pro",
+  "appName": "MonoLens Pro",
+  "webDir": "dist",
+  "bundledWebRuntime": false
+}
