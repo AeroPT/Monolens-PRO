@@ -2,6 +2,7 @@ import { FilterSettings } from '../types';
 import { getCurveLut, isCurveNeutral } from './curveMath';
 import { getBwChannelWeights } from './bwFilters';
 import { encodeDngFromImageData, DngMetadata } from './dngEncoder';
+import { PreviewMediaElement, getPreviewDimensions } from './previewMedia';
 
 const HIGH_PREC_STEPS = 4096;
 
@@ -200,12 +201,11 @@ const finalizeCanvasCapture = (
 };
 
 export const snapshotVideoCanvas = (
-  video: HTMLVideoElement,
+  media: PreviewMediaElement,
   zoom: number,
   isNativeZoom: boolean
 ): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } | null => {
-  const width = video.videoWidth;
-  const height = video.videoHeight;
+  const { width, height } = getPreviewDimensions(media);
   if (!width || !height) return null;
 
   const canvas = document.createElement('canvas');
@@ -218,14 +218,14 @@ export const snapshotVideoCanvas = (
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
 
-  if (isNativeZoom || zoom === 1) {
-    ctx.drawImage(video, 0, 0, width, height);
+  if (isNativeZoom || zoom <= 1) {
+    ctx.drawImage(media, 0, 0, width, height);
   } else {
     const cropW = width / zoom;
     const cropH = height / zoom;
     const sx = (width - cropW) / 2;
     const sy = (height - cropH) / 2;
-    ctx.drawImage(video, sx, sy, cropW, cropH, 0, 0, width, height);
+    ctx.drawImage(media, sx, sy, cropW, cropH, 0, 0, width, height);
   }
 
   return { canvas, ctx };
@@ -266,7 +266,7 @@ const processCanvasSource = (
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
 
-  if (isNativeZoom || zoom === 1) {
+  if (isNativeZoom || zoom <= 1) {
     ctx.drawImage(source, 0, 0, width, height);
   } else {
     const cropW = width / zoom;
@@ -283,18 +283,19 @@ const processCanvasSource = (
  * Capture directly from Video Element (Exact live HDR/exposure/focus preview frame)
  */
 export const processImage = (
-  video: HTMLVideoElement,
+  media: PreviewMediaElement,
   settings: FilterSettings,
   zoom: number,
   isNativeZoom: boolean,
   captureDng = false,
   dngMeta?: DngMetadata
 ): ProcessedCaptureResult => {
+  const { width, height } = getPreviewDimensions(media);
   return (
     processCanvasSource(
-      video,
-      video.videoWidth,
-      video.videoHeight,
+      media,
+      width,
+      height,
       settings,
       zoom,
       isNativeZoom,

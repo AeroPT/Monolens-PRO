@@ -38,6 +38,11 @@ import {
   isProCaptureSupported,
   inferLensHint,
 } from '../utils/proCapture';
+import {
+  PreviewMediaElement,
+  getPreviewDimensions,
+  isPreviewReady,
+} from '../utils/previewMedia';
 import { runContrastAutofocusSweep } from '../utils/contrastAutofocus';
 import {
   VisualObjectTracker,
@@ -110,7 +115,9 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
   lastImage,
 }) => {
   const { toggleLang, t } = useI18n();
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const nativePreviewImgRef = useRef<HTMLImageElement | null>(null);
+  const previewElRef = useRef<PreviewMediaElement | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const focusReticleRef = useRef<HTMLDivElement>(null);
   const selectedAfCoordsRef = useRef<{ x: number; y: number }>({
@@ -133,6 +140,12 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
 
   const [captureMode, setCaptureMode] = useState<CaptureMode>(loadSavedCaptureMode);
   const [showModeMenu, setShowModeMenu] = useState(false);
+  const [suppressWebStream, setSuppressWebStream] = useState(false);
+  const [nativePreviewUrl, setNativePreviewUrl] = useState<string | null>(null);
+  const [isNativePreviewReady, setIsNativePreviewReady] = useState(false);
+  const nativePreviewActiveRef = useRef(false);
+  const nativeTransitionQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const isMountedRef = useRef(true);
 
   const {
     devices,
@@ -149,6 +162,8 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
     zoomRange,
     setZoom,
     supportsNativeZoom,
+    supportsWebUltraWide,
+    nativeTeleZoom,
     supportsExposure,
     exposureRange,
     setExposure,
@@ -165,7 +180,7 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
     setManualFocusDistance,
     pauseStreamForProCapture,
     resumeStreamAfterProCapture,
-  } = useCamera(captureMode);
+  } = useCamera(captureMode, suppressWebStream);
 
   const [settings, setSettings] = useState<FilterSettings>(loadSavedFilterSettings);
   const [history, setHistory] = useState<FilterSettings[]>([]);
@@ -280,30 +295,23 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
   }, [settings.curvePoints]);
 
   const captureViewfinderFreezeFrame = useCallback(() => {
-    const videoEl = videoRef.current;
+    const mediaEl = previewElRef.current;
     const freezeCanvas = freezeCanvasRef.current;
-    if (
-      !videoEl ||
-      !freezeCanvas ||
-      videoEl.readyState < 2 ||
-      !videoEl.videoWidth ||
-      !videoEl.videoHeight
-    ) {
+    if (!mediaEl || !freezeCanvas || !isPreviewReady(mediaEl)) {
       return;
     }
+    const { width: mediaW, height: mediaH } = getPreviewDimensions(mediaEl);
+    if (!mediaW || !mediaH) return;
     try {
       const maxDim = 1280;
-      const scale = Math.min(
-        1,
-        maxDim / Math.max(videoEl.videoWidth, videoEl.videoHeight)
-      );
-      const w = Math.max(1, Math.round(videoEl.videoWidth * scale));
-      const h = Math.max(1, Math.round(videoEl.videoHeight * scale));
+      const scale = Math.min(1, maxDim / Math.max(mediaW, mediaH));
+      const w = Math.max(1, Math.round(mediaW * scale));
+      const h = Math.max(1, Math.round(mediaH * scale));
       if (freezeCanvas.width !== w) freezeCanvas.width = w;
       if (freezeCanvas.height !== h) freezeCanvas.height = h;
       const ctx = freezeCanvas.getContext('2d');
       if (ctx) {
-        ctx.drawImage(videoEl, 0, 0, w, h);
+        ctx.drawImage(mediaEl, 0, 0, w, h);
         setIsFreezeVisible(true);
       }
     } catch {
@@ -335,7 +343,9 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
   }, []);
 
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       if (exposureLongPressTimer.current) {
         clearTimeout(exposureLongPressTimer.current);
       }
@@ -344,6 +354,10 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
       }
       if (toastTimerRef.current) {
         clearTimeout(toastTimerRef.current);
+      }
+      if (isProCaptureSupported()) {
+        nativePreviewActiveRef.current = false;
+        void ProCapture.stopLivePreview().catch(() => {});
       }
     };
   }, []);
@@ -428,6 +442,17 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
       setManualExposureTime(nextTime);
       setManualIso(nextIso);
 
+      if (nativePreviewActiveRef.current && isProCaptureSupported()) {
+        await ProCapture.updatePreviewExposure({
+          exposureMode: nextMode,
+          exposureTimeNs: Math.round(nextTime * 100_000),
+          iso: Math.round(nextIso),
+          exposureCompensationEv: exposureStateRef.current.exposureVal,
+        }).catch(() => {});
+        setSettings(prev => ({ ...prev, exposureGain: 1.0 }));
+        return;
+      }
+
       if (nextMode === 'auto') {
         await applyManualExposure('auto');
         setSettings(prev => ({ ...prev, exposureGain: 1.0 }));
@@ -467,6 +492,25 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
       exposureRange,
       setExposure,
     ]
+  );
+
+  const syncExposureCompensation = useCallback(
+    (nextEv: number) => {
+      setExposureVal(nextEv);
+      if (nativePreviewActiveRef.current && isProCaptureSupported()) {
+        void ProCapture.updatePreviewExposure({
+          exposureMode: exposureStateRef.current.exposureMode,
+          exposureTimeNs: Math.round(
+            exposureStateRef.current.manualExposureTime * 100_000
+          ),
+          iso: Math.round(exposureStateRef.current.manualIso),
+          exposureCompensationEv: nextEv,
+        }).catch(() => {});
+      } else {
+        void setExposure(nextEv);
+      }
+    },
+    [setExposure]
   );
 
   // Restore saved exposure & focus mode once a new stream is ready
@@ -511,15 +555,21 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
     setFocusMode,
   ]);
 
+  const applyZoomWithUltraWideCheck = useCallback(
+    (nextZoom: number) => {
+      void setZoom(nextZoom);
+    },
+    [setZoom]
+  );
+
   // Double-tap reset handlers for HUD controls
   const handleDoubleTapZoomReset = useDoubleTap(() => {
-    setZoom(zoomRange.min);
+    void setZoom(Math.min(zoomRange.max, Math.max(zoomRange.min, 1)));
   });
 
   const handleDoubleTapExposureReset = useDoubleTap(() => {
-    setExposureVal(0);
-    setExposure(0);
-    applyUnifiedExposure('auto', 80, 200);
+    syncExposureCompensation(0);
+    void applyUnifiedExposure('auto', 80, 200);
   });
 
   const handleDoubleTapFocusReset = useDoubleTap(() => {
@@ -664,11 +714,20 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
         showToast(t.modeToast(meta.label));
       }
     },
-    [captureMode, captureViewfinderFreezeFrame, getLocalizedModeMeta, showToast, t]
+    [
+      captureMode,
+      captureViewfinderFreezeFrame,
+      getLocalizedModeMeta,
+      showToast,
+      t,
+    ]
   );
 
   const executeCapture = async () => {
-    if (!videoRef.current || !stream || isCapturing) return;
+    const isNativeLive = nativePreviewActiveRef.current && !!nativePreviewUrl;
+    if ((!stream && !isNativeLive) || !previewElRef.current || isCapturing) {
+      return;
+    }
     setShowModeMenu(false);
     setShowPeakMenu(false);
     setIsCapturing(true);
@@ -680,30 +739,38 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
       // Ignore on web
     }
 
-    const isNativeSensorMax =
-      captureMode === 'sensor_max' && isProCaptureSupported();
+    // Use native Camera2 still capture in Sensor Max, or when Ultra-Wide native preview is active in 4K Stream
+    const useNativeStill =
+      isProCaptureSupported() &&
+      (captureMode === 'sensor_max' ||
+        (isNativeLive && captureMode === 'stream4k'));
     setTimeout(() => setIsFlashing(false), 75);
 
     try {
       const nowTs = Date.now();
 
-      if (isNativeSensorMax) {
+      if (useNativeStill) {
         const activeDevice = devices.find(d => d.deviceId === activeDeviceId);
         const deviceLabel = activeDevice?.label || '';
         const lensHint = inferLensHint(deviceLabel);
         const afCoords = selectedAfCoordsRef.current;
         const exposureTimeNs = Math.round(manualExposureTime * 100_000);
+        const wantRaw = captureMode === 'sensor_max' && captureRawOriginal;
 
         captureViewfinderFreezeFrame();
-        pendingHardwareRestoreRef.current = true;
-        await pauseStreamForProCapture();
+        if (isNativeLive) {
+          await ProCapture.stopLivePreview().catch(() => {});
+        } else {
+          pendingHardwareRestoreRef.current = true;
+          await pauseStreamForProCapture();
+        }
 
         let proRes: Awaited<ReturnType<typeof ProCapture.captureStill>>;
         try {
           proRes = await ProCapture.captureStill({
             deviceLabel,
             lensHint,
-            captureRaw: captureRawOriginal,
+            captureRaw: wantRaw,
             autoSaveRaw: false,
             focusX: afCoords.x,
             focusY: afCoords.y,
@@ -715,12 +782,40 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
             zoomRatio: zoom,
           });
         } finally {
-          resumeStreamAfterProCapture();
+          if (nativePreviewActiveRef.current && isProCaptureSupported()) {
+            try {
+              const restarted = await ProCapture.startLivePreview({
+                deviceLabel,
+                lensHint,
+                focusX: afCoords.x,
+                focusY: afCoords.y,
+                focusMode,
+                exposureMode,
+                exposureTimeNs,
+                iso: Math.round(manualIso),
+                exposureCompensationEv: exposureVal,
+                zoomRatio: zoom,
+              });
+              if (isMountedRef.current) {
+                setIsNativePreviewReady(false);
+                setNativePreviewUrl(restarted.url);
+              } else {
+                void ProCapture.stopLivePreview().catch(() => {});
+              }
+            } catch {
+              nativePreviewActiveRef.current = false;
+              setSuppressWebStream(false);
+              setNativePreviewUrl(null);
+              resumeStreamAfterProCapture();
+            }
+          } else {
+            resumeStreamAfterProCapture();
+          }
         }
 
         const jpegSrc = Capacitor.convertFileSrc(proRes.jpegPath);
         const processed = await reprocessImageFromUrl(jpegSrc, settings, {
-          includeColorCopyMaxDim: captureRawOriginal ? 1600 : undefined,
+          includeColorCopyMaxDim: wantRaw ? 1600 : undefined,
         });
 
         onCapture({
@@ -729,7 +824,7 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
           thumbnailUrl: processed.thumbnailUrl,
           originalUrl: processed.originalUrl,
           dngFilePath: proRes.dngPath,
-          captureMode: 'sensor_max',
+          captureMode,
           width: processed.width,
           height: processed.height,
           timestamp: nowTs,
@@ -741,41 +836,41 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
           1_000_000
         ).toFixed(1);
 
-        showToast(
-          t.sensorMaxSaved(mpLabel, !!(captureRawOriginal && proRes.dngPath))
-        );
+        showToast(t.sensorMaxSaved(mpLabel, !!(wantRaw && proRes.dngPath)));
         return;
       }
 
       // Freeze the viewfinder preview immediately (same experience as Max Sensor)
-      // and grab the raw full-res frame at t=0 before waiting for the shutter blink to fade.
+      // and grab the raw frame at t=0 before waiting for the shutter blink to fade.
       captureViewfinderFreezeFrame();
 
       let grabbedBitmap: ImageBitmap | null = null;
       let fallbackSnapshot: ReturnType<typeof snapshotVideoCanvas> = null;
-      const track = stream.getVideoTracks()[0];
+      const track = stream?.getVideoTracks()[0];
       const capturer =
-        'ImageCapture' in window ? new (window as any).ImageCapture(track) : null;
+        !isNativeLive && track && 'ImageCapture' in window
+          ? new (window as any).ImageCapture(track)
+          : null;
 
       if (
         capturer &&
         typeof capturer.grabFrame === 'function' &&
-        track.readyState === 'live'
+        track?.readyState === 'live'
       ) {
         try {
           grabbedBitmap = await capturer.grabFrame();
         } catch {
           fallbackSnapshot = snapshotVideoCanvas(
-            videoRef.current,
+            previewElRef.current,
             zoom,
-            supportsNativeZoom
+            isNativeLive || supportsNativeZoom
           );
         }
       } else {
         fallbackSnapshot = snapshotVideoCanvas(
-          videoRef.current,
+          previewElRef.current,
           zoom,
-          supportsNativeZoom
+          isNativeLive || supportsNativeZoom
         );
       }
 
@@ -847,7 +942,7 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
       const errMsg = e instanceof Error ? e.message : t.captureError;
       showToast(errMsg);
     } finally {
-      if (!isNativeSensorMax) {
+      if (!useNativeStill) {
         setIsFreezeVisible(false);
       }
       setIsCapturing(false);
@@ -855,7 +950,10 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
   };
 
   const handleCapture = () => {
-    if (!videoRef.current || !stream || isCapturing) return;
+    const isNativeLive = nativePreviewActiveRef.current && !!nativePreviewUrl;
+    if ((!stream && !isNativeLive) || !previewElRef.current || isCapturing) {
+      return;
+    }
 
     if (countdown !== null) {
       if (countdownTimerRef.current) {
@@ -916,9 +1014,8 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
   const resetSettings = () => {
     saveHistory();
     setSettings(cloneFilterSettings(DEFAULT_SETTINGS));
-    applyUnifiedExposure('auto', 80, 200);
-    setExposureVal(0);
-    setExposure(0);
+    syncExposureCompensation(0);
+    void applyUnifiedExposure('auto', 80, 200);
   };
 
   const handleOpenPanel = (
@@ -961,7 +1058,7 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
       const ratio = currentDist / initialPinchDist.current;
       let newZoom = initialZoomLevel.current * ratio;
       newZoom = Math.min(Math.max(newZoom, zoomRange.min), zoomRange.max);
-      setZoom(newZoom);
+      applyZoomWithUltraWideCheck(newZoom);
       return;
     }
     if (e.touches.length === 1 && touchStartPos.current && !isPinching.current) {
@@ -988,8 +1085,7 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
           supportsExposure ? exposureRange.min : -2,
           Math.min(supportsExposure ? exposureRange.max : 2, newVal)
         );
-        setExposureVal(newVal);
-        setExposure(newVal);
+        syncExposureCompensation(newVal);
       }
     }
   };
@@ -1054,14 +1150,16 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
     }
 
     let videoNorm = { x: x / 100, y: y / 100 };
-    if (videoRef.current && videoRef.current.readyState >= 2) {
+    const mediaEl = previewElRef.current;
+    if (isPreviewReady(mediaEl)) {
+      const { width: mediaW, height: mediaH } = getPreviewDimensions(mediaEl);
       videoNorm = screenPercentToVideoNorm(
         x,
         y,
         rect.width,
         rect.height,
-        videoRef.current.videoWidth,
-        videoRef.current.videoHeight
+        mediaW,
+        mediaH
       );
     }
 
@@ -1078,19 +1176,28 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
       tracking: false,
     });
 
-    if (
-      trackerRef.current &&
-      videoRef.current &&
-      videoRef.current.readyState >= 2
-    ) {
-      trackerRef.current.initAtVideoNorm(
-        videoRef.current,
-        videoNorm.x,
-        videoNorm.y
-      );
+    if (trackerRef.current && isPreviewReady(mediaEl)) {
+      trackerRef.current.initAtVideoNorm(mediaEl!, videoNorm.x, videoNorm.y);
     }
 
-    if (
+    if (nativePreviewActiveRef.current && isProCaptureSupported()) {
+      await ProCapture.updatePreviewFocus({
+        focusX: videoNorm.x,
+        focusY: videoNorm.y,
+        focusMode,
+      }).catch(() => {});
+      setTimeout(() => {
+        if (sweepId === afSweepIdRef.current) {
+          setFocusPoint(prev => ({
+            ...prev,
+            x: focusPointRef.current.x,
+            y: focusPointRef.current.y,
+            working: false,
+            tracking: trackerRef.current?.getIsActive() ?? false,
+          }));
+        }
+      }, 360);
+    } else if (
       supportsManualFocus &&
       focusDistanceRange.max > focusDistanceRange.min &&
       videoRef.current &&
@@ -1168,6 +1275,14 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
       selectedAfCoordsRef.current = { x: 0.5, y: 0.5 };
     }
 
+    if (nativePreviewActiveRef.current && isProCaptureSupported()) {
+      await ProCapture.updatePreviewFocus({
+        focusX: selectedAfCoordsRef.current.x,
+        focusY: selectedAfCoordsRef.current.y,
+        focusMode: nextMode,
+      }).catch(() => {});
+    }
+
     await setFocusMode(
       nextMode,
       nextMode === 'single-shot' ? selectedAfCoordsRef.current : undefined
@@ -1185,17 +1300,18 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
     let lastTime = 0;
 
     const tick = (now: number) => {
+      const mediaEl = previewElRef.current;
       if (
         trackerRef.current?.getIsActive() &&
-        videoRef.current &&
+        mediaEl &&
         containerRef.current &&
-        videoRef.current.readyState >= 2
+        isPreviewReady(mediaEl)
       ) {
         if (now - lastTime >= 30) {
           lastTime = now;
           const container = containerRef.current;
           const res = trackerRef.current.update(
-            videoRef.current,
+            mediaEl,
             container.clientWidth,
             container.clientHeight
           );
@@ -1231,9 +1347,8 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
 
   const startExposurePress = () => {
     exposureLongPressTimer.current = setTimeout(() => {
-      setExposureVal(0);
-      setExposure(0);
-      applyUnifiedExposure('auto', 80, 200);
+      syncExposureCompensation(0);
+      void applyUnifiedExposure('auto', 80, 200);
     }, 600);
   };
 
@@ -1246,7 +1361,25 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
   const handleLensClick = (deviceId: string) => {
     if (deviceId !== activeDeviceId) {
       captureViewfinderFreezeFrame();
-      switchCamera(deviceId);
+      if (nativePreviewActiveRef.current && isProCaptureSupported()) {
+        nativePreviewActiveRef.current = false;
+        setNativePreviewUrl(null);
+        setIsNativePreviewReady(false);
+        setSuppressWebStream(false);
+        nativeTransitionQueueRef.current = nativeTransitionQueueRef.current
+          .then(async () => {
+            await ProCapture.stopLivePreview().catch(() => {});
+            switchCamera(deviceId);
+          })
+          .catch(() => {
+            switchCamera(deviceId);
+          });
+      } else {
+        switchCamera(deviceId);
+      }
+    } else if (Math.abs(zoom - 1) > 0.03) {
+      triggerLightHaptic();
+      void setZoom(Math.min(zoomRange.max, Math.max(zoomRange.min, 1)));
     }
   };
 
@@ -1301,6 +1434,147 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
     return t.lensFallback(index + 1);
   };
 
+  const activeDeviceObj = devices.find(d => d.deviceId === activeDeviceId);
+  const isFrontActive =
+    !!activeDeviceObj && activeDeviceObj.label.toLowerCase().includes('front');
+  const hasDedicatedWideDevice = backDevices.some(d => {
+    const l = d.label.toLowerCase();
+    return (
+      l.includes('ultra') ||
+      l.includes('wide') ||
+      l.includes('0.7') ||
+      l.includes('0.6')
+    );
+  });
+  const showLogicalWidePreset =
+    !isFrontActive && !hasDedicatedWideDevice && zoomRange.min < 0.95;
+  const showLogicalTelePreset =
+    !isFrontActive &&
+    nativeTeleZoom !== null &&
+    nativeTeleZoom > 2.2 &&
+    !backDevices.some(d => {
+      const l = d.label.toLowerCase();
+      return l.includes('tele') || l.includes('zoom');
+    });
+
+  const shouldUseNativePreview =
+    isProCaptureSupported() &&
+    !supportsWebUltraWide &&
+    !isFrontActive &&
+    zoom < 0.95 &&
+    !error;
+
+  const shouldUseNativePreviewRef = useRef(shouldUseNativePreview);
+  shouldUseNativePreviewRef.current = shouldUseNativePreview;
+  const latestZoomRef = useRef(zoom);
+  latestZoomRef.current = zoom;
+  const focusModeRef = useRef(focusMode);
+  focusModeRef.current = focusMode;
+  const devicesRef = useRef(devices);
+  devicesRef.current = devices;
+  const activeDeviceIdRef = useRef(activeDeviceId);
+  activeDeviceIdRef.current = activeDeviceId;
+
+  // Transition seamlessly between WebRTC (<video>) and native Camera2 MJPEG (<img>) for Ultra-Wide < 1x
+  useEffect(() => {
+    if (isCapturing) return;
+
+    if (shouldUseNativePreview && !nativePreviewActiveRef.current) {
+      nativeTransitionQueueRef.current = nativeTransitionQueueRef.current.then(
+        async () => {
+          if (
+            !isMountedRef.current ||
+            nativePreviewActiveRef.current ||
+            !shouldUseNativePreviewRef.current
+          ) {
+            return;
+          }
+          nativePreviewActiveRef.current = true;
+          setSuppressWebStream(true);
+          captureViewfinderFreezeFrame();
+          await pauseStreamForProCapture();
+
+          if (!isMountedRef.current || !shouldUseNativePreviewRef.current) {
+            nativePreviewActiveRef.current = false;
+            setSuppressWebStream(false);
+            resumeStreamAfterProCapture();
+            return;
+          }
+
+          try {
+            const dev = devicesRef.current.find(
+              d => d.deviceId === activeDeviceIdRef.current
+            );
+            const devLabel = dev?.label || '';
+            const lensHint = inferLensHint(devLabel);
+            const expState = exposureStateRef.current;
+            const res = await ProCapture.startLivePreview({
+              deviceLabel: devLabel,
+              lensHint,
+              focusX: selectedAfCoordsRef.current.x,
+              focusY: selectedAfCoordsRef.current.y,
+              focusMode: focusModeRef.current,
+              exposureMode: expState.exposureMode,
+              exposureTimeNs: Math.round(expState.manualExposureTime * 100_000),
+              iso: Math.round(expState.manualIso),
+              exposureCompensationEv: expState.exposureVal,
+              zoomRatio: latestZoomRef.current,
+            });
+            if (!isMountedRef.current || !shouldUseNativePreviewRef.current) {
+              await ProCapture.stopLivePreview().catch(() => {});
+              nativePreviewActiveRef.current = false;
+              setSuppressWebStream(false);
+              resumeStreamAfterProCapture();
+              return;
+            }
+            setIsNativePreviewReady(false);
+            setNativePreviewUrl(res.url);
+          } catch {
+            nativePreviewActiveRef.current = false;
+            setSuppressWebStream(false);
+            setNativePreviewUrl(null);
+            setIsFreezeVisible(false);
+            resumeStreamAfterProCapture();
+          }
+        }
+      );
+    } else if (!shouldUseNativePreview && nativePreviewActiveRef.current) {
+      nativeTransitionQueueRef.current = nativeTransitionQueueRef.current.then(
+        async () => {
+          if (
+            !isMountedRef.current ||
+            !nativePreviewActiveRef.current ||
+            shouldUseNativePreviewRef.current
+          ) {
+            return;
+          }
+          captureViewfinderFreezeFrame();
+          nativePreviewActiveRef.current = false;
+          setNativePreviewUrl(null);
+          setIsNativePreviewReady(false);
+          await ProCapture.stopLivePreview().catch(() => {});
+          if (!isMountedRef.current) return;
+          setSuppressWebStream(false);
+          pendingHardwareRestoreRef.current = true;
+          resumeStreamAfterProCapture();
+        }
+      );
+    }
+  }, [
+    shouldUseNativePreview,
+    isCapturing,
+    captureViewfinderFreezeFrame,
+    pauseStreamForProCapture,
+    resumeStreamAfterProCapture,
+  ]);
+
+  // Smooth live zoom updates while native Ultra-Wide preview is active (0.7x..0.94x)
+  useEffect(() => {
+    if (shouldUseNativePreview && nativePreviewActiveRef.current && nativePreviewUrl) {
+      void ProCapture.updatePreviewZoom({ zoomRatio: zoom }).catch(() => {});
+    }
+  }, [zoom, shouldUseNativePreview, nativePreviewUrl]);
+
   const activeModeMeta = getLocalizedModeMeta(captureMode);
   const localizedError =
     error === 'PERMISSION_DENIED'
@@ -1318,6 +1592,8 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
   const peakingDef = getPeakingColorDef(peakingColor);
   const hudVisible = !showControls && !isAdjustingExposure && !isModifying;
   const rightHudVisible = hudVisible && countdown === null;
+  const hasLiveFeed = !!stream || !!nativePreviewUrl;
+  const isMediaReady = nativePreviewUrl ? isNativePreviewReady : isVideoReady;
 
   return (
     <div className="relative w-full h-full bg-black select-none overflow-hidden touch-none flex flex-col">
@@ -1352,45 +1628,75 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
               ref={freezeCanvasRef}
               aria-hidden="true"
               className={`absolute inset-0 w-full h-full object-cover pointer-events-none z-[2] ${
-                isFreezeVisible && (!isVideoReady || isCapturing)
+                isFreezeVisible && (!isMediaReady || isCapturing)
                   ? 'opacity-100'
                   : 'opacity-0'
               }`}
               style={{
                 filter: 'url(#mono-pro-filter)',
                 transform:
-                  !supportsNativeZoom && zoom > 1 ? `scale(${zoom})` : 'none',
+                  !nativePreviewUrl && !supportsNativeZoom && zoom > 1
+                    ? `scale(${zoom})`
+                    : 'none',
               }}
             />
-            {stream && (
-              <video
-                key={stream.id}
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                controls={false}
-                disableRemotePlayback
-                poster={TRANSPARENT_POSTER}
-                onPlaying={() => {
-                  setIsVideoReady(true);
-                  setIsFreezeVisible(false);
+            {nativePreviewUrl ? (
+              <img
+                key={nativePreviewUrl}
+                ref={el => {
+                  nativePreviewImgRef.current = el;
+                  previewElRef.current = el;
                 }}
-                className={`w-full h-full object-cover transform ${
-                  isVideoReady ? 'opacity-100' : 'opacity-0'
+                src={nativePreviewUrl}
+                crossOrigin="anonymous"
+                alt=""
+                onLoad={() => {
+                  if (!isNativePreviewReady) {
+                    setIsNativePreviewReady(true);
+                    setIsFreezeVisible(false);
+                  }
+                }}
+                className={`w-full h-full object-cover ${
+                  isNativePreviewReady ? 'opacity-100' : 'opacity-0'
                 }`}
                 style={{
                   filter: 'url(#mono-pro-filter)',
-                  transform:
-                    !supportsNativeZoom && zoom > 1 ? `scale(${zoom})` : 'none',
                 }}
               />
+            ) : (
+              stream && (
+                <video
+                  key={stream.id}
+                  ref={el => {
+                    videoRef.current = el;
+                    previewElRef.current = el;
+                  }}
+                  autoPlay
+                  playsInline
+                  muted
+                  controls={false}
+                  disableRemotePlayback
+                  poster={TRANSPARENT_POSTER}
+                  onPlaying={() => {
+                    setIsVideoReady(true);
+                    setIsFreezeVisible(false);
+                  }}
+                  className={`w-full h-full object-cover transform ${
+                    isVideoReady ? 'opacity-100' : 'opacity-0'
+                  }`}
+                  style={{
+                    filter: 'url(#mono-pro-filter)',
+                    transform:
+                      !supportsNativeZoom && zoom > 1 ? `scale(${zoom})` : 'none',
+                  }}
+                />
+              )
             )}
           </>
         )}
 
         {/* Live Optical Vignette Preview */}
-        {(settings.vignette ?? 0) > 0.005 && !error && !!stream && (
+        {(settings.vignette ?? 0) > 0.005 && !error && hasLiveFeed && (
           <div
             className="absolute inset-0 pointer-events-none z-[3]"
             style={{
@@ -1402,7 +1708,7 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
         )}
 
         {/* Live Organic Film Grain Preview */}
-        {(settings.grain ?? 0) > 0.005 && !error && !!stream && (
+        {(settings.grain ?? 0) > 0.005 && !error && hasLiveFeed && (
           <svg
             className="absolute inset-0 w-full h-full pointer-events-none z-[4]"
             style={{
@@ -1430,15 +1736,15 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
 
         {/* Focus Peaking & Highlight Zebras Live Canvas Overlay */}
         <AssistOverlay
-          videoRef={videoRef}
+          videoRef={previewElRef}
           settings={settings}
           zoom={zoom}
-          supportsNativeZoom={supportsNativeZoom}
+          supportsNativeZoom={supportsNativeZoom || !!nativePreviewUrl}
           peakingEnabled={peakingEnabled}
           peakingColor={peakingColor}
           peakingIntensity={peakingIntensity}
           zebrasEnabled={zebrasEnabled}
-          visible={!error && !!stream && !isModifying}
+          visible={!error && hasLiveFeed && !isModifying}
         />
 
         {/* Shutter Timer Countdown Overlay */}
@@ -1463,9 +1769,9 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
         {/* Real-time Luminance Histogram */}
         <div className="absolute top-24 left-5 z-20 origin-top-left">
           <Histogram
-            videoRef={videoRef}
+            videoRef={previewElRef}
             settings={settings}
-            visible={!error && !!stream && !showControls}
+            visible={!error && hasLiveFeed && !showControls}
           />
         </div>
 
@@ -1862,13 +2168,13 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
         {/* Framing Grid Lines */}
         <FramingGrid
           mode={gridMode}
-          visible={!error && !!stream && !isModifying}
+          visible={!error && hasLiveFeed && !isModifying}
         />
 
         {/* Horizontal Spirit Level */}
         <HorizontalLevel
           enabled={showLevel}
-          visible={!error && !!stream && !showControls && !isModifying}
+          visible={!error && hasLiveFeed && !showControls && !isModifying}
         />
       </div>
 
@@ -1881,9 +2187,37 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
         >
           <div className="bg-black/65 backdrop-blur-3xl rounded-full border border-white/20 shadow-2xl max-w-[90vw] overflow-hidden p-1 w-max">
             <div className="flex flex-nowrap overflow-x-auto no-scrollbar items-center px-1.5 space-x-1.5 h-9">
+              {showLogicalWidePreset && (
+                <button
+                  key="logical-wide"
+                  type="button"
+                  onClick={() => {
+                    triggerLightHaptic();
+                    applyZoomWithUltraWideCheck(zoomRange.min);
+                  }}
+                  className={`relative flex-shrink-0 px-3.5 py-1.5 rounded-full text-[10px] font-mono font-bold tracking-widest whitespace-nowrap leading-none transition-all duration-200 uppercase ${
+                    zoom < 0.92
+                      ? 'bg-white text-black shadow-lg'
+                      : 'bg-transparent text-white/55 hover:text-white/85'
+                  }`}
+                >
+                  <span className="block whitespace-nowrap">
+                    {zoomRange.min.toFixed(1)}× WIDE
+                  </span>
+                </button>
+              )}
               {sortedDevices.map((device, idx) => {
-                const isActive = activeDeviceId === device.deviceId;
                 const label = getLensLabel(device, idx);
+                const isMainRear =
+                  device.deviceId === activeDeviceId &&
+                  !device.label.toLowerCase().includes('front') &&
+                  label === '1× MAIN';
+                const isActive = isMainRear
+                  ? (!showLogicalWidePreset || zoom >= 0.92) &&
+                    (!showLogicalTelePreset ||
+                      !nativeTeleZoom ||
+                      zoom < nativeTeleZoom - 0.3)
+                  : activeDeviceId === device.deviceId;
                 return (
                   <button
                     key={device.deviceId}
@@ -1899,6 +2233,25 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
                   </button>
                 );
               })}
+              {showLogicalTelePreset && nativeTeleZoom && (
+                <button
+                  key="logical-tele"
+                  type="button"
+                  onClick={() => {
+                    triggerLightHaptic();
+                    applyZoomWithUltraWideCheck(nativeTeleZoom);
+                  }}
+                  className={`relative flex-shrink-0 px-3.5 py-1.5 rounded-full text-[10px] font-mono font-bold tracking-widest whitespace-nowrap leading-none transition-all duration-200 uppercase ${
+                    zoom >= nativeTeleZoom - 0.3
+                      ? 'bg-white text-black shadow-lg'
+                      : 'bg-transparent text-white/55 hover:text-white/85'
+                  }`}
+                >
+                  <span className="block whitespace-nowrap">
+                    {Math.round(nativeTeleZoom)}× TELE
+                  </span>
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -1950,10 +2303,12 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
                 type="range"
                 min={zoomRange.min}
                 max={zoomRange.max}
-                step={0.1}
+                step={0.05}
                 value={zoom}
                 onPointerUp={handleDoubleTapZoomReset}
-                onChange={e => setZoom(parseFloat(e.target.value))}
+                onChange={e =>
+                  applyZoomWithUltraWideCheck(parseFloat(e.target.value))
+                }
                 className="w-full h-1 bg-white/20 rounded-lg appearance-none cursor-pointer range-thumb-style"
                 aria-label="Zoom"
               />
@@ -2127,7 +2482,7 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
               <div className="w-full max-w-sm mx-auto pb-2">
                 <CurvesControl
                   points={settings.curvePoints}
-                  videoRef={videoRef}
+                  videoRef={previewElRef}
                   colorFilter={settings.colorFilter}
                   onChange={pts => updateSetting('curvePoints', pts)}
                   onInteractionStateChange={setIsAdjustingCurve}
@@ -2231,11 +2586,11 @@ const CameraInterface: React.FC<CameraInterfaceProps> = ({
           <button
             type="button"
             onClick={handleCapture}
-            disabled={!stream || isCapturing}
+            disabled={!hasLiveFeed || isCapturing}
             aria-label={countdown !== null ? t.cancel : 'Shutter'}
             className={`w-20 h-20 rounded-full border-4 flex items-center justify-center bg-transparent active:scale-95 transition-all shadow-[0_0_20px_rgba(255,255,255,0.12)] ${
               countdown !== null ? 'border-yellow-400' : 'border-white/25'
-            } ${isCapturing || !stream ? 'opacity-50' : ''}`}
+            } ${isCapturing || !hasLiveFeed ? 'opacity-50' : ''}`}
           >
             <div
               className={`w-16 h-16 rounded-full shadow-inner transition-colors ${

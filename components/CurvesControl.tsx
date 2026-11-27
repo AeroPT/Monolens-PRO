@@ -9,6 +9,7 @@ import {
   isCurveNeutral,
 } from '../utils/curveMath';
 import { getBwChannelWeights } from '../utils/bwFilters';
+import { PreviewMediaElement, isPreviewReady } from '../utils/previewMedia';
 import { Trash2, RotateCcw } from 'lucide-react';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import { useDoubleTap } from '../utils/useDoubleTap';
@@ -17,7 +18,7 @@ import { useI18n } from '../utils/i18n';
 interface CurvesControlProps {
   points: Point[];
   onChange: (points: Point[]) => void;
-  videoRef?: React.RefObject<HTMLVideoElement | null>;
+  videoRef?: React.RefObject<PreviewMediaElement | null>;
   colorFilter?: BwColorFilterId;
   onInteractionStateChange?: (isInteracting: boolean) => void;
   onInteractionStart?: () => void;
@@ -124,52 +125,56 @@ const CurvesControl: React.FC<CurvesControlProps> = ({
     const drawHistogram = (now: number) => {
       if (now - lastDraw >= 80) {
         lastDraw = now;
-        const video = videoRef.current;
+        const media = videoRef.current;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        if (video && video.readyState >= 2) {
-          sCtx.drawImage(video, 0, 0, sampleCanvas.width, sampleCanvas.height);
-          const data = sCtx.getImageData(
-            0,
-            0,
-            sampleCanvas.width,
-            sampleCanvas.height
-          ).data;
+        if (isPreviewReady(media)) {
+          try {
+            sCtx.drawImage(media!, 0, 0, sampleCanvas.width, sampleCanvas.height);
+            const data = sCtx.getImageData(
+              0,
+              0,
+              sampleCanvas.width,
+              sampleCanvas.height
+            ).data;
 
-          // 64 smooth bins for clean visual curve backdrop
-          const bins = new Float32Array(64);
-          let maxBin = 1;
-          for (let i = 0; i < data.length; i += 4) {
-            const gray = wr * data[i] + wg * data[i + 1] + wb * data[i + 2];
-            const binIdx = Math.min(63, Math.floor((gray / 255) * 63));
-            bins[binIdx] += 1;
-            if (bins[binIdx] > maxBin) maxBin = bins[binIdx];
+            // 64 smooth bins for clean visual curve backdrop
+            const bins = new Float32Array(64);
+            let maxBin = 1;
+            for (let i = 0; i < data.length; i += 4) {
+              const gray = wr * data[i] + wg * data[i + 1] + wb * data[i + 2];
+              const binIdx = Math.min(63, Math.floor((gray / 255) * 63));
+              bins[binIdx] += 1;
+              if (bins[binIdx] > maxBin) maxBin = bins[binIdx];
+            }
+
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx.beginPath();
+            ctx.moveTo(0, h);
+            for (let b = 0; b < 64; b++) {
+              const x = (b / 63) * w;
+              const norm = Math.sqrt(bins[b] / maxBin);
+              const y = h - norm * h * 0.85;
+              ctx.lineTo(x, y);
+            }
+            ctx.lineTo(w, h);
+            ctx.closePath();
+
+            const interacting = isInteractingRef.current;
+            ctx.fillStyle = interacting
+              ? 'rgba(255, 255, 255, 0.08)'
+              : 'rgba(255, 255, 255, 0.14)';
+            ctx.fill();
+
+            ctx.strokeStyle = interacting
+              ? 'rgba(255, 255, 255, 0.16)'
+              : 'rgba(255, 255, 255, 0.25)';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+          } catch {
+            // Ignore transient drawImage errors during source switch
           }
-
-          const w = canvas.width;
-          const h = canvas.height;
-          ctx.beginPath();
-          ctx.moveTo(0, h);
-          for (let b = 0; b < 64; b++) {
-            const x = (b / 63) * w;
-            const norm = Math.sqrt(bins[b] / maxBin);
-            const y = h - norm * h * 0.85;
-            ctx.lineTo(x, y);
-          }
-          ctx.lineTo(w, h);
-          ctx.closePath();
-
-          const interacting = isInteractingRef.current;
-          ctx.fillStyle = interacting
-            ? 'rgba(255, 255, 255, 0.08)'
-            : 'rgba(255, 255, 255, 0.14)';
-          ctx.fill();
-
-          ctx.strokeStyle = interacting
-            ? 'rgba(255, 255, 255, 0.16)'
-            : 'rgba(255, 255, 255, 0.25)';
-          ctx.lineWidth = 1;
-          ctx.stroke();
         }
       }
       rafId = requestAnimationFrame(drawHistogram);

@@ -2,6 +2,11 @@ import React, { memo, useEffect, useMemo, useRef } from 'react';
 import { FilterSettings, PeakingColorId } from '../types';
 import { generateLut } from '../utils/imageProcessing';
 import { getBwChannelWeights } from '../utils/bwFilters';
+import {
+  PreviewMediaElement,
+  getPreviewDimensions,
+  isPreviewReady,
+} from '../utils/previewMedia';
 
 export interface PeakingColorDef {
   id: PeakingColorId;
@@ -23,7 +28,7 @@ export const getPeakingColorDef = (id?: PeakingColorId): PeakingColorDef => {
 };
 
 interface AssistOverlayProps {
-  videoRef: React.RefObject<HTMLVideoElement | null>;
+  videoRef: React.RefObject<PreviewMediaElement | null>;
   settings: FilterSettings;
   zoom: number;
   supportsNativeZoom: boolean;
@@ -116,10 +121,13 @@ const AssistOverlay: React.FC<AssistOverlayProps> = ({
       if (now - lastDraw < 80) return; // ~12fps smooth & low-power
       lastDraw = now;
 
-      const video = videoRef.current;
-      if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+      const media = videoRef.current;
+      if (!isPreviewReady(media)) {
         return;
       }
+
+      const { width: vw, height: vh } = getPreviewDimensions(media);
+      if (!vw || !vh) return;
 
       const cw = containerSizeRef.current.width || canvas.clientWidth;
       const ch = containerSizeRef.current.height || canvas.clientHeight;
@@ -138,8 +146,6 @@ const AssistOverlay: React.FC<AssistOverlayProps> = ({
         outImageRef.current = ctx.createImageData(targetW, targetH);
       }
 
-      const vw = video.videoWidth;
-      const vh = video.videoHeight;
       const videoAspect = vw / vh;
 
       let srcW = vw;
@@ -160,8 +166,13 @@ const AssistOverlay: React.FC<AssistOverlayProps> = ({
       const sx = (vw - srcW) * 0.5;
       const sy = (vh - srcH) * 0.5;
 
-      sCtx.drawImage(video, sx, sy, srcW, srcH, 0, 0, targetW, targetH);
-      const srcData = sCtx.getImageData(0, 0, targetW, targetH).data;
+      let srcData: Uint8ClampedArray;
+      try {
+        sCtx.drawImage(media!, sx, sy, srcW, srcH, 0, 0, targetW, targetH);
+        srcData = sCtx.getImageData(0, 0, targetW, targetH).data;
+      } catch {
+        return;
+      }
 
       const grayBuf = grayBufferRef.current!;
       const outImg = outImageRef.current!;

@@ -142,6 +142,8 @@ export const translations = {
     sensorMaxBrowserNote:
       'No browser usa fallback de stream; no Android usa Camera2 nativo.',
     sensorMaxToastWeb: 'Sensor Máx selecionado (Camera2 nativo ativo no Android)',
+    ultraWideNativeOnly: (z: string): string =>
+      `Ultra-Wide (${z}×) ativo no disparo Sensor Máx (visor WebView limitado a 1×)`,
     modeToast: (label: string): string => `Modo: ${label}`,
     colorLabel: 'Cor',
     intensityLabel: 'Intensidade',
@@ -306,6 +308,8 @@ export const translations = {
     sensorMaxBrowserNote:
       'Uses stream fallback in browser; native Camera2 on Android.',
     sensorMaxToastWeb: 'Max Sensor selected (native Camera2 active on Android)',
+    ultraWideNativeOnly: (z: string): string =>
+      `Ultra-Wide (${z}×) active on Max Sensor capture (WebView preview capped at 1×)`,
     modeToast: (label: string): string => `Mode: ${label}`,
     colorLabel: 'Color',
     intensityLabel: 'Intensity',

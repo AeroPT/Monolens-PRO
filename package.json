@@ -1,3 +1,4 @@
+
 {
   "name": "monolens-pro",
   "private": true,
@@ -8,8 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "android:sync": "npm run build && npx cap sync android",
-    "android:apk": "npm run android:sync && node scripts/build-apk.mjs",
-    "android:release": "npm run android:sync && node scripts/build-apk.mjs --release"
+    "android:apk": "npm run build && npx cap sync android && node scripts/build-apk.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^6.1.2",
@@ -30,8 +30,5 @@
     "tailwindcss": "^3.4.16",
     "typescript": "^5.7.2",
     "vite": "^6.0.3"
-  },
-  "allowScripts": {
-    "esbuild@0.25.12": true
   }
 }
