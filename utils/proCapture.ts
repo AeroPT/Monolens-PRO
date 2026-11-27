@@ -10,6 +10,9 @@ export interface ProCapturePlugin {
     maxWidth: number;
     maxHeight: number;
     rawSupported: boolean;
+    minZoom?: number;
+    maxZoom?: number;
+    physicalTeleZoom?: number;
   }>;
 
   captureStill(options: {
@@ -35,6 +38,40 @@ export interface ProCapturePlugin {
     dngPath?: string;
     dngSavedToGallery?: boolean;
   }>;
+
+  startLivePreview(options: {
+    deviceLabel: string;
+    lensHint: string;
+    focusX: number;
+    focusY: number;
+    focusMode: 'continuous' | 'single-shot';
+    exposureMode: 'auto' | 'manual';
+    exposureTimeNs?: number;
+    iso?: number;
+    exposureCompensationEv?: number;
+    zoomRatio?: number;
+  }): Promise<{
+    url: string;
+    width: number;
+    height: number;
+  }>;
+
+  stopLivePreview(): Promise<void>;
+
+  updatePreviewZoom(options: { zoomRatio: number }): Promise<void>;
+
+  updatePreviewFocus(options: {
+    focusX: number;
+    focusY: number;
+    focusMode: 'continuous' | 'single-shot';
+  }): Promise<void>;
+
+  updatePreviewExposure(options: {
+    exposureMode: 'auto' | 'manual';
+    exposureTimeNs?: number;
+    iso?: number;
+    exposureCompensationEv?: number;
+  }): Promise<void>;
 }
 
 export const ProCapture = registerPlugin<ProCapturePlugin>('ProCapture');

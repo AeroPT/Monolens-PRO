@@ -2,9 +2,10 @@ import React, { memo, useRef, useEffect, useMemo } from 'react';
 import { FilterSettings } from '../types';
 import { generateLut } from '../utils/imageProcessing';
 import { getBwChannelWeights } from '../utils/bwFilters';
+import { PreviewMediaElement, isPreviewReady } from '../utils/previewMedia';
 
 interface HistogramProps {
-  videoRef: React.RefObject<HTMLVideoElement | null>;
+  videoRef: React.RefObject<PreviewMediaElement | null>;
   settings: FilterSettings;
   visible: boolean;
 }
@@ -41,12 +42,13 @@ const Histogram: React.FC<HistogramProps> = ({ videoRef, settings, visible }) =>
       if (now - lastRenderTime < 66) return;
       lastRenderTime = now;
 
-      const video = videoRef.current;
-      if (video && video.readyState >= 2) {
-        processCtx.drawImage(video, 0, 0, processCanvas.width, processCanvas.height);
+      const media = videoRef.current;
+      if (isPreviewReady(media)) {
+        try {
+          processCtx.drawImage(media!, 0, 0, processCanvas.width, processCanvas.height);
 
-        const frame = processCtx.getImageData(0, 0, processCanvas.width, processCanvas.height);
-        const data = frame.data;
+          const frame = processCtx.getImageData(0, 0, processCanvas.width, processCanvas.height);
+          const data = frame.data;
 
         const bins = new Uint32Array(256);
         let maxCount = 1;
@@ -86,6 +88,9 @@ const Histogram: React.FC<HistogramProps> = ({ videoRef, settings, visible }) =>
 
         ctx.lineTo(width, height);
         ctx.fill();
+        } catch {
+          // Ignore transient drawImage frame errors during camera switch
+        }
       }
     };
 

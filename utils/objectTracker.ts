@@ -1,8 +1,13 @@
 /**
- * Lightweight real-time visual object tracker for live HTMLVideoElement feeds.
+ * Lightweight real-time visual object tracker for live HTMLVideoElement or MJPEG HTMLImageElement feeds.
  * Uses mean-normalized Sum of Absolute Differences (SAD) template matching on a
  * downsampled luminance buffer, with object-cover viewport coordinate mapping.
  */
+import {
+  PreviewMediaElement,
+  getPreviewDimensions,
+  isPreviewReady,
+} from './previewMedia';
 
 export interface NormalizedPoint {
   x: number; // 0..1 in video frame or container space
@@ -115,15 +120,19 @@ export class VisualObjectTracker {
     this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
   }
 
-  private sampleGrayscale(video: HTMLVideoElement): Uint8Array | null {
-    if (!this.ctx || video.readyState < 2 || !video.videoWidth) return null;
-    this.ctx.drawImage(video, 0, 0, PROC_W, PROC_H);
-    const rgba = this.ctx.getImageData(0, 0, PROC_W, PROC_H).data;
-    const gray = new Uint8Array(PROC_W * PROC_H);
-    for (let i = 0, j = 0; i < rgba.length; i += 4, j++) {
-      gray[j] = (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) >> 8;
+  private sampleGrayscale(media: PreviewMediaElement): Uint8Array | null {
+    if (!this.ctx || !isPreviewReady(media)) return null;
+    try {
+      this.ctx.drawImage(media, 0, 0, PROC_W, PROC_H);
+      const rgba = this.ctx.getImageData(0, 0, PROC_W, PROC_H).data;
+      const gray = new Uint8Array(PROC_W * PROC_H);
+      for (let i = 0, j = 0; i < rgba.length; i += 4, j++) {
+        gray[j] = (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) >> 8;
+      }
+      return gray;
+    } catch {
+      return null;
     }
-    return gray;
   }
 
   private extractPatch(
@@ -156,11 +165,11 @@ export class VisualObjectTracker {
   }
 
   public initAtVideoNorm(
-    video: HTMLVideoElement,
+    media: PreviewMediaElement,
     videoX: number,
     videoY: number
   ): boolean {
-    const gray = this.sampleGrayscale(video);
+    const gray = this.sampleGrayscale(media);
     if (!gray) return false;
 
     const cx = Math.round(
@@ -189,12 +198,12 @@ export class VisualObjectTracker {
   }
 
   public update(
-    video: HTMLVideoElement,
+    media: PreviewMediaElement,
     containerW: number,
     containerH: number
   ): TrackResult | null {
     if (!this.isActive || !this.template) return null;
-    const gray = this.sampleGrayscale(video);
+    const gray = this.sampleGrayscale(media);
     if (!gray) return null;
 
     const prevCx = Math.round(this.posX * PROC_W);
@@ -303,13 +312,14 @@ export class VisualObjectTracker {
       }
     }
 
+    const { width: mediaW, height: mediaH } = getPreviewDimensions(media);
     const screen = videoNormToScreenPercent(
       this.posX,
       this.posY,
       containerW,
       containerH,
-      video.videoWidth,
-      video.videoHeight
+      mediaW,
+      mediaH
     );
 
     return {

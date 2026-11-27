@@ -1,5 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { CameraDevice, CaptureMode } from '../types';
+import {
+  ProCapture,
+  isProCaptureSupported,
+  inferLensHint,
+} from '../utils/proCapture';
 
 export type FocusMode = 'continuous' | 'single-shot';
 export type CameraErrorCode = 'PERMISSION_DENIED' | 'LENS_ERROR';
@@ -80,7 +85,10 @@ const requestCameraStream = async (
   throw lastErr;
 };
 
-export const useCamera = (captureMode: CaptureMode = 'fast') => {
+export const useCamera = (
+  captureMode: CaptureMode = 'fast',
+  suppressWebStream = false
+) => {
   const [devices, setDevices] = useState<CameraDevice[]>([]);
   const [activeDeviceId, setActiveDeviceId] = useState<string | null>(() => {
     try {
@@ -103,6 +111,7 @@ export const useCamera = (captureMode: CaptureMode = 'fast') => {
   });
   const [supportsManualFocus, setSupportsManualFocus] = useState(false);
 
+  const devicesRef = useRef<CameraDevice[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
   const isLockingRef = useRef<boolean>(false);
   const focusRangeRef = useRef<CapabilityRange>({ min: 0, max: 0, step: 0 });
@@ -110,12 +119,19 @@ export const useCamera = (captureMode: CaptureMode = 'fast') => {
   const supportedFocusModesRef = useRef<string[]>([]);
   const focusModeRef = useRef<FocusMode>('continuous');
   const zoomRangeRef = useRef({ min: 1, max: 1 });
+  const webZoomRangeRef = useRef({ min: 1, max: 1 });
   const supportsNativeZoomRef = useRef(false);
   const supportsExposureRef = useRef(false);
+  const zoomRef = useRef(1);
+  const lastDeviceIdForStreamRef = useRef<string | null>(null);
+  const suppressWebStreamRef = useRef(suppressWebStream);
+  suppressWebStreamRef.current = suppressWebStream;
 
   const [zoom, setZoomState] = useState(1);
   const [zoomRange, setZoomRange] = useState({ min: 1, max: 1 });
   const [supportsNativeZoom, setSupportsNativeZoom] = useState(false);
+  const [supportsWebUltraWide, setSupportsWebUltraWide] = useState(false);
+  const [nativeTeleZoom, setNativeTeleZoom] = useState<number | null>(null);
 
   const [exposureRange, setExposureRange] = useState<CapabilityRange>({
     min: -2,
@@ -173,6 +189,7 @@ export const useCamera = (captureMode: CaptureMode = 'fast') => {
           deviceId: device.deviceId,
           label: device.label || `Camera ${device.deviceId.slice(0, 5)}`,
         }));
+        devicesRef.current = formattedDevices;
         setDevices(formattedDevices);
         if (formattedDevices.length > 0) {
           setActiveDeviceId(prev => {
@@ -209,6 +226,7 @@ export const useCamera = (captureMode: CaptureMode = 'fast') => {
 
   useEffect(() => {
     if (!activeDeviceId) return;
+    if (suppressWebStreamRef.current) return;
     let isMounted = true;
     const startStream = async () => {
       const hadActiveStream = !!streamRef.current;
@@ -219,25 +237,36 @@ export const useCamera = (captureMode: CaptureMode = 'fast') => {
       setStream(null);
       setError(null);
 
-      // Reset capabilities state
+      const isSameDeviceRestart =
+        lastDeviceIdForStreamRef.current === activeDeviceId;
+      lastDeviceIdForStreamRef.current = activeDeviceId;
+      const preservedZoom = isSameDeviceRestart ? zoomRef.current : 1;
+
+      // Reset capabilities state (preserve optical zoom & tele cap on same-device restart)
       isLockingRef.current = false;
       supportsFocusRef.current = false;
       supportedFocusModesRef.current = [];
       supportsNativeZoomRef.current = false;
       supportsExposureRef.current = false;
-      zoomRangeRef.current = { min: 1, max: 1 };
+      if (!isSameDeviceRestart) {
+        zoomRangeRef.current = { min: 1, max: 1 };
+        webZoomRangeRef.current = { min: 1, max: 1 };
+        setZoomRange({ min: 1, max: 1 });
+        setNativeTeleZoom(null);
+        zoomRef.current = 1;
+        setZoomState(1);
+      }
       setSupportsFocus(false);
       setSupportedFocusModes([]);
       setSupportsManualFocus(false);
       setSupportsNativeZoom(false);
+      setSupportsWebUltraWide(false);
       setSupportsExposure(false);
       setSupportedExposureModes([]);
       setSupportsExposureTime(false);
       setSupportsIso(false);
       setExposureTimeRange({ min: 3, max: 5000, step: 1 });
       setIsoRange({ min: 50, max: 3200, step: 10 });
-      setZoomRange({ min: 1, max: 1 });
-      setZoomState(1);
 
       // Only pause briefly to let Android Camera2 release an active session
       if (hadActiveStream) {
@@ -293,16 +322,83 @@ export const useCamera = (captureMode: CaptureMode = 'fast') => {
           focusRangeRef.current = { min: 0, max: 0, step: 0 };
         }
 
+        let webRange = { min: 1, max: 4 };
         if (caps.zoom) {
-          const zRange = { min: caps.zoom.min, max: caps.zoom.max };
+          webRange = { min: caps.zoom.min, max: caps.zoom.max };
           supportsNativeZoomRef.current = true;
-          zoomRangeRef.current = zRange;
+          webZoomRangeRef.current = webRange;
+          zoomRangeRef.current = {
+            min: isSameDeviceRestart
+              ? Math.min(zoomRangeRef.current.min, webRange.min)
+              : webRange.min,
+            max: isSameDeviceRestart
+              ? Math.max(zoomRangeRef.current.max, webRange.max)
+              : webRange.max,
+          };
           setSupportsNativeZoom(true);
-          setZoomRange(zRange);
-          setZoomState(trackSettings.zoom ?? caps.zoom.min);
+          setSupportsWebUltraWide(caps.zoom.min < 0.95);
+          setZoomRange(zoomRangeRef.current);
+          const targetZoom = isSameDeviceRestart
+            ? Math.min(
+                zoomRangeRef.current.max,
+                Math.max(zoomRangeRef.current.min, preservedZoom)
+              )
+            : typeof trackSettings.zoom === 'number'
+            ? trackSettings.zoom
+            : Math.min(webRange.max, Math.max(webRange.min, 1));
+          zoomRef.current = targetZoom;
+          setZoomState(targetZoom);
+          const webClamped = Math.min(webRange.max, Math.max(webRange.min, targetZoom));
+          if (Math.abs(webClamped - (trackSettings.zoom ?? 1)) > 0.01) {
+            initialConstraints.zoom = webClamped;
+          }
         } else {
-          zoomRangeRef.current = { min: 1, max: 4 };
-          setZoomRange({ min: 1, max: 4 });
+          webZoomRangeRef.current = webRange;
+          if (!isSameDeviceRestart) {
+            zoomRangeRef.current = webRange;
+            setZoomRange(webRange);
+          }
+          setSupportsWebUltraWide(false);
+        }
+
+        if (isProCaptureSupported()) {
+          const activeDev = devicesRef.current.find(d => d.deviceId === activeDeviceId);
+          const devLabel = activeDev?.label || '';
+          const lensHint = inferLensHint(devLabel);
+          if (lensHint !== 'front') {
+            ProCapture.getCapabilities({ deviceLabel: devLabel, lensHint })
+              .then(nativeCaps => {
+                if (!isMounted) return;
+                const nativeMin =
+                  typeof nativeCaps.minZoom === 'number' && nativeCaps.minZoom > 0.2
+                    ? nativeCaps.minZoom
+                    : webRange.min;
+                const nativeMax =
+                  typeof nativeCaps.maxZoom === 'number' && nativeCaps.maxZoom > 1
+                    ? nativeCaps.maxZoom
+                    : webRange.max;
+                const mergedRange = {
+                  min: Math.min(webRange.min, nativeMin),
+                  max: Math.max(webRange.max, nativeMax),
+                };
+                if (
+                  mergedRange.min < zoomRangeRef.current.min ||
+                  mergedRange.max > zoomRangeRef.current.max
+                ) {
+                  zoomRangeRef.current = mergedRange;
+                  setZoomRange(mergedRange);
+                }
+                if (
+                  typeof nativeCaps.physicalTeleZoom === 'number' &&
+                  nativeCaps.physicalTeleZoom > 2.2
+                ) {
+                  setNativeTeleZoom(nativeCaps.physicalTeleZoom);
+                }
+              })
+              .catch(() => {
+                // Ignore if native capabilities unavailable
+              });
+          }
         }
 
         if (caps.exposureCompensation) {
@@ -536,12 +632,15 @@ export const useCamera = (captureMode: CaptureMode = 'fast') => {
   const setZoom = useCallback(async (value: number) => {
     const { min, max } = zoomRangeRef.current;
     const newZoom = Math.min(Math.max(value, min), max);
+    zoomRef.current = newZoom;
     setZoomState(newZoom);
     if (supportsNativeZoomRef.current && streamRef.current) {
       const track = streamRef.current.getVideoTracks()[0];
+      const { min: wMin, max: wMax } = webZoomRangeRef.current;
+      const webClampedZoom = Math.min(Math.max(newZoom, wMin), wMax);
       try {
         await track.applyConstraints({
-          advanced: [{ zoom: newZoom } as any],
+          advanced: [{ zoom: webClampedZoom } as any],
         });
       } catch {
         // Ignore
@@ -643,6 +742,8 @@ export const useCamera = (captureMode: CaptureMode = 'fast') => {
     zoomRange,
     setZoom,
     supportsNativeZoom,
+    supportsWebUltraWide,
+    nativeTeleZoom,
     supportsExposure,
     exposureRange,
     setExposure,

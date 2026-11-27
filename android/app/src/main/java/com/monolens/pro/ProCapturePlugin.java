@@ -9,6 +9,7 @@ import android.content.pm.PackageManager;
 import android.graphics.ImageFormat;
 import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
+import android.graphics.YuvImage;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
@@ -45,14 +46,21 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
+import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -73,6 +81,20 @@ public class ProCapturePlugin extends Plugin {
 
     private static final Pattern CAMERA2_ID_PATTERN = Pattern.compile("camera2\\s+(\\d+)", Pattern.CASE_INSENSITIVE);
     private final AtomicBoolean busy = new AtomicBoolean(false);
+    private final Object previewLock = new Object();
+    private volatile LivePreviewSession activePreview = null;
+
+    @Override
+    protected void handleOnPause() {
+        super.handleOnPause();
+        new Thread(this::stopLivePreviewInternal, "MonoLensPreviewPauseStop").start();
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        stopLivePreviewInternal();
+        super.handleOnDestroy();
+    }
 
     @PluginMethod
     public void getCapabilities(PluginCall call) {
@@ -94,15 +116,124 @@ public class ProCapturePlugin extends Plugin {
             Size maxJpeg = map != null ? maxByArea(map.getOutputSizes(ImageFormat.JPEG)) : null;
             boolean rawCapable = supportsRawCapture(chars, map);
 
+            float minZoom = 1.0f;
+            float maxZoom = 1.0f;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Range<Float> zRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
+                if (zRange != null) {
+                    minZoom = zRange.getLower();
+                    maxZoom = zRange.getUpper();
+                }
+            }
+            if (maxZoom <= 1.0f) {
+                Float maxDigital = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+                if (maxDigital != null && maxDigital > 1.0f) {
+                    maxZoom = maxDigital;
+                }
+            }
+
+            double physicalTeleZoom = 0.0;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                try {
+                    float[] mainFocals = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+                    float baseFocal = (mainFocals != null && mainFocals.length > 0) ? mainFocals[0] : 0f;
+                    if (baseFocal > 0f) {
+                        for (String physId : chars.getPhysicalCameraIds()) {
+                            CameraCharacteristics pChars = manager.getCameraCharacteristics(physId);
+                            float[] pFocals = pChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+                            if (pFocals != null && pFocals.length > 0) {
+                                float ratio = pFocals[0] / baseFocal;
+                                if (ratio > 2.2f && ratio > physicalTeleZoom && ratio <= maxZoom + 0.5f) {
+                                    physicalTeleZoom = ratio;
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+
             JSObject ret = new JSObject();
             ret.put("cameraId", cameraId);
             ret.put("maxWidth", maxJpeg != null ? maxJpeg.getWidth() : 0);
             ret.put("maxHeight", maxJpeg != null ? maxJpeg.getHeight() : 0);
             ret.put("rawSupported", rawCapable);
+            ret.put("minZoom", minZoom);
+            ret.put("maxZoom", maxZoom);
+            if (physicalTeleZoom > 0.0) {
+                ret.put("physicalTeleZoom", Math.round(physicalTeleZoom * 10.0) / 10.0);
+            }
             call.resolve(ret);
         } catch (Exception e) {
             call.reject("CAPABILITIES_ERROR: " + e.getMessage(), e);
         }
+    }
+
+    @PluginMethod
+    public void startLivePreview(PluginCall call) {
+        if (ContextCompat.checkSelfPermission(getContext(), Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED
+            && getPermissionState("camera") != PermissionState.GRANTED) {
+            call.reject("CAMERA_PERMISSION_DENIED");
+            return;
+        }
+        startLivePreviewAsync(call);
+    }
+
+    @PluginMethod
+    public void stopLivePreview(PluginCall call) {
+        getBridge().execute(() -> {
+            stopLivePreviewInternal();
+            call.resolve();
+        });
+    }
+
+    @PluginMethod
+    public void updatePreviewZoom(PluginCall call) {
+        Double zoomObj = call.getDouble("zoomRatio", 1.0);
+        final double nextZoom = clamp(zoomObj != null ? zoomObj : 1.0, 0.4, 10.0);
+        final LivePreviewSession session = activePreview;
+        if (session == null || session.closed) {
+            call.resolve();
+            return;
+        }
+        session.zoomRatio = nextZoom;
+        session.postRepeatingUpdate(false);
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void updatePreviewFocus(PluginCall call) {
+        Double fxObj = call.getDouble("focusX", 0.5);
+        Double fyObj = call.getDouble("focusY", 0.5);
+        String fMode = call.getString("focusMode", "continuous");
+        final LivePreviewSession session = activePreview;
+        if (session == null || session.closed) {
+            call.resolve();
+            return;
+        }
+        session.focusX = clamp(fxObj != null ? fxObj : 0.5, 0.05, 0.95);
+        session.focusY = clamp(fyObj != null ? fyObj : 0.5, 0.05, 0.95);
+        session.focusMode = fMode != null ? fMode : "continuous";
+        session.postRepeatingUpdate(true);
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void updatePreviewExposure(PluginCall call) {
+        String expMode = call.getString("exposureMode", "auto");
+        Long expObj = call.getLong("exposureTimeNs", 0L);
+        Integer isoObj = call.getInt("iso", 0);
+        Double evObj = call.getDouble("exposureCompensationEv", 0.0);
+        final LivePreviewSession session = activePreview;
+        if (session == null || session.closed) {
+            call.resolve();
+            return;
+        }
+        session.exposureMode = expMode != null ? expMode : "auto";
+        session.exposureTimeNs = expObj != null ? expObj : 0L;
+        session.iso = isoObj != null ? isoObj : 0;
+        session.ev = evObj != null ? evObj : 0.0;
+        session.postRepeatingUpdate(false);
+        call.resolve();
     }
 
     @PluginMethod
@@ -148,11 +279,12 @@ public class ProCapturePlugin extends Plugin {
         final long exposureTimeNs = expObj != null ? expObj : 0L;
         final int iso = isoObj != null ? isoObj : 0;
         final double ev = evObj != null ? evObj : 0.0;
-        final double zoomRatio = clamp(zoomObj != null ? zoomObj : 1.0, 1.0, 10.0);
+        final double zoomRatio = clamp(zoomObj != null ? zoomObj : 1.0, 0.4, 10.0);
         final int displayRotation = getDisplayRotationDegrees();
 
         getBridge().execute(() -> {
             try {
+                stopLivePreviewInternal();
                 performCamera2Capture(
                     call,
                     deviceLabel,
@@ -492,14 +624,16 @@ public class ProCapturePlugin extends Plugin {
                     dngCreator.writeImage(dngOut, rawImage);
                     dngOut.flush();
                     dngPath = dngFile.getAbsolutePath();
-                }
 
-                if (autoSaveRaw && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    dngSavedToGallery = writeFileToMediaStore(
-                        dngFile,
-                        "RAW_" + ts + ".dng",
-                        "image/x-adobe-dng"
-                    );
+                    if (autoSaveRaw && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        dngSavedToGallery = writeFileToMediaStore(
+                            dngFile,
+                            "RAW_" + ts + ".dng",
+                            "image/x-adobe-dng"
+                        );
+                    }
+                } catch (Exception ignored) {
+                    dngPath = null;
                 }
             }
 
@@ -688,14 +822,14 @@ public class ProCapturePlugin extends Plugin {
             }
         }
 
-        if (zoomRatio > 1.01) {
+        if (Math.abs(zoomRatio - 1.0) > 0.01) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 Range<Float> zoomRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
                 if (zoomRange != null) {
                     float clampedZoom = Math.max(zoomRange.getLower(), Math.min(zoomRange.getUpper(), (float) zoomRatio));
                     builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, clampedZoom);
                 }
-            } else {
+            } else if (zoomRatio > 1.01) {
                 Rect active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
                 Float maxDigital = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
                 if (active != null && maxDigital != null && maxDigital > 1.0f) {
@@ -911,6 +1045,621 @@ public class ProCapturePlugin extends Plugin {
             resolver.delete(itemUri, null, null);
             return false;
         }
+    }
+
+    private void startLivePreviewAsync(PluginCall call) {
+        final String deviceLabel = call.getString("deviceLabel", "");
+        final String lensHint = call.getString("lensHint", "main");
+        Double fxObj = call.getDouble("focusX", 0.5);
+        Double fyObj = call.getDouble("focusY", 0.5);
+        final double focusX = clamp(fxObj != null ? fxObj : 0.5, 0.05, 0.95);
+        final double focusY = clamp(fyObj != null ? fyObj : 0.5, 0.05, 0.95);
+        final String focusMode = call.getString("focusMode", "continuous");
+        final String exposureMode = call.getString("exposureMode", "auto");
+        Long expObj = call.getLong("exposureTimeNs", 0L);
+        Integer isoObj = call.getInt("iso", 0);
+        Double evObj = call.getDouble("exposureCompensationEv", 0.0);
+        Double zoomObj = call.getDouble("zoomRatio", 1.0);
+        final long exposureTimeNs = expObj != null ? expObj : 0L;
+        final int iso = isoObj != null ? isoObj : 0;
+        final double ev = evObj != null ? evObj : 0.0;
+        final double zoomRatio = clamp(zoomObj != null ? zoomObj : 1.0, 0.4, 10.0);
+
+        getBridge().execute(() -> {
+            synchronized (previewLock) {
+                stopLivePreviewInternal();
+                LivePreviewSession session = null;
+                try {
+                    CameraManager manager = (CameraManager) getContext().getSystemService(Context.CAMERA_SERVICE);
+                    if (manager == null) {
+                        call.reject("CAMERA_MANAGER_UNAVAILABLE");
+                        return;
+                    }
+                    String cameraId = resolveCameraId(manager, deviceLabel, lensHint);
+                    if (cameraId == null) {
+                        call.reject("NO_CAMERA_FOUND");
+                        return;
+                    }
+                    CameraCharacteristics chars = manager.getCameraCharacteristics(cameraId);
+                    StreamConfigurationMap map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+                    if (map == null) {
+                        call.reject("STREAM_MAP_UNAVAILABLE");
+                        return;
+                    }
+                    Size previewSize = selectPreviewSize(map.getOutputSizes(ImageFormat.YUV_420_888));
+                    if (previewSize == null) {
+                        call.reject("NO_PREVIEW_SIZE_AVAILABLE");
+                        return;
+                    }
+
+                    session = new LivePreviewSession(
+                        cameraId,
+                        chars,
+                        previewSize,
+                        zoomRatio,
+                        focusX,
+                        focusY,
+                        focusMode != null ? focusMode : "continuous",
+                        exposureMode != null ? exposureMode : "auto",
+                        exposureTimeNs,
+                        iso,
+                        ev
+                    );
+                    session.start(manager);
+                    activePreview = session;
+
+                    int jpegOrientation = computeJpegOrientation(chars, getDisplayRotationDegrees());
+                    boolean isRotated = jpegOrientation == 90 || jpegOrientation == 270;
+                    int outW = isRotated ? previewSize.getHeight() : previewSize.getWidth();
+                    int outH = isRotated ? previewSize.getWidth() : previewSize.getHeight();
+
+                    JSObject ret = new JSObject();
+                    ret.put("url", "http://127.0.0.1:" + session.serverSocket.getLocalPort() + "/stream.mjpeg");
+                    ret.put("width", outW);
+                    ret.put("height", outH);
+                    call.resolve(ret);
+                } catch (Throwable t) {
+                    if (session != null) {
+                        session.close();
+                    }
+                    activePreview = null;
+                    call.reject("LIVE_PREVIEW_START_FAILED: " + t.getMessage(), new Exception(t));
+                }
+            }
+        });
+    }
+
+    private void stopLivePreviewInternal() {
+        synchronized (previewLock) {
+            LivePreviewSession s = activePreview;
+            activePreview = null;
+            if (s != null) {
+                s.close();
+            }
+        }
+    }
+
+    private final class LivePreviewSession {
+        final String cameraId;
+        final CameraCharacteristics chars;
+        final boolean hasAf;
+        final boolean isFront;
+        final Size previewSize;
+
+        volatile double zoomRatio;
+        volatile double focusX;
+        volatile double focusY;
+        volatile String focusMode;
+        volatile String exposureMode;
+        volatile long exposureTimeNs;
+        volatile int iso;
+        volatile double ev;
+        volatile boolean closed = false;
+
+        final Object frameMonitor = new Object();
+        final Object frameEncodeLock = new Object();
+        final CopyOnWriteArrayList<Socket> clientSockets = new CopyOnWriteArrayList<>();
+        final ByteArrayOutputStream jpegBaos = new ByteArrayOutputStream(131072);
+
+        CameraDevice cameraDevice;
+        CameraCaptureSession captureSession;
+        ImageReader yuvReader;
+        HandlerThread handlerThread;
+        Handler handler;
+        HandlerThread readerThread;
+        Handler readerHandler;
+        ServerSocket serverSocket;
+        Thread acceptThread;
+        byte[] latestJpeg;
+        long frameSeq = 0L;
+        byte[] nv21Buffer;
+        byte[] srcYBuf;
+        byte[] srcUBuf;
+        byte[] srcVBuf;
+
+        LivePreviewSession(
+            String cameraId,
+            CameraCharacteristics chars,
+            Size previewSize,
+            double zoomRatio,
+            double focusX,
+            double focusY,
+            String focusMode,
+            String exposureMode,
+            long exposureTimeNs,
+            int iso,
+            double ev
+        ) {
+            this.cameraId = cameraId;
+            this.chars = chars;
+            this.hasAf = hasAutofocus(chars);
+            Integer lensFacing = chars.get(CameraCharacteristics.LENS_FACING);
+            this.isFront = lensFacing != null && lensFacing == CameraCharacteristics.LENS_FACING_FRONT;
+            this.previewSize = previewSize;
+            this.zoomRatio = zoomRatio;
+            this.focusX = focusX;
+            this.focusY = focusY;
+            this.focusMode = focusMode;
+            this.exposureMode = exposureMode;
+            this.exposureTimeNs = exposureTimeNs;
+            this.iso = iso;
+            this.ev = ev;
+        }
+
+        void start(CameraManager manager) throws Exception {
+            serverSocket = new ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"));
+            acceptThread = new Thread(this::runAcceptLoop, "MonoLensMjpegAccept");
+            acceptThread.setDaemon(true);
+            acceptThread.start();
+
+            handlerThread = new HandlerThread("MonoLensLivePreview");
+            handlerThread.start();
+            handler = new Handler(handlerThread.getLooper());
+
+            readerThread = new HandlerThread("MonoLensYuvReader");
+            readerThread.start();
+            readerHandler = new Handler(readerThread.getLooper());
+
+            cameraDevice = openCameraWithRetry(manager, cameraId, handler);
+            yuvReader = ImageReader.newInstance(
+                previewSize.getWidth(),
+                previewSize.getHeight(),
+                ImageFormat.YUV_420_888,
+                3
+            );
+            yuvReader.setOnImageAvailableListener(this::onImageAvailable, readerHandler);
+
+            List<Surface> outputs = new ArrayList<>();
+            outputs.add(yuvReader.getSurface());
+            captureSession = createSessionSync(cameraDevice, outputs, handler);
+            applyRepeatingRequest(false);
+        }
+
+        void postRepeatingUpdate(boolean triggerAf) {
+            Handler h = handler;
+            if (h == null || closed) return;
+            h.post(() -> {
+                if (closed) return;
+                applyRepeatingRequest(triggerAf);
+            });
+        }
+
+        private void applyRepeatingRequest(boolean triggerAf) {
+            CameraDevice dev = cameraDevice;
+            CameraCaptureSession session = captureSession;
+            ImageReader reader = yuvReader;
+            if (closed || dev == null || session == null || reader == null) return;
+
+            try {
+                int displayRotation = getDisplayRotationDegrees();
+                int jpegOrientation = computeJpegOrientation(chars, displayRotation);
+                boolean isManualExp = "manual".equals(exposureMode) && exposureTimeNs > 0 && iso > 0;
+                MeteringRectangle[] afRegions = buildTapRegions(chars, focusX, focusY, jpegOrientation, isFront);
+
+                CaptureRequest.Builder builder = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                builder.addTarget(reader.getSurface());
+                applyCommonControls(
+                    builder,
+                    chars,
+                    hasAf,
+                    focusMode,
+                    afRegions,
+                    isManualExp,
+                    exposureTimeNs,
+                    iso,
+                    ev,
+                    zoomRatio
+                );
+                if (!isManualExp) {
+                    Range<Integer> fpsRange = selectPreviewFpsRange(chars);
+                    if (fpsRange != null) {
+                        builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange);
+                    }
+                }
+                session.setRepeatingRequest(builder.build(), null, handler);
+
+                if (triggerAf && hasAf) {
+                    CaptureRequest.Builder trig = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                    trig.addTarget(reader.getSurface());
+                    applyCommonControls(
+                        trig,
+                        chars,
+                        true,
+                        focusMode,
+                        afRegions,
+                        isManualExp,
+                        exposureTimeNs,
+                        iso,
+                        ev,
+                        zoomRatio
+                    );
+                    if (!isManualExp) {
+                        Range<Integer> fpsRange = selectPreviewFpsRange(chars);
+                        if (fpsRange != null) {
+                            trig.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange);
+                        }
+                    }
+                    trig.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START);
+                    session.capture(trig.build(), null, handler);
+                }
+            } catch (Exception ignored) {}
+        }
+
+        private void onImageAvailable(ImageReader reader) {
+            synchronized (frameEncodeLock) {
+                Image image = null;
+                try {
+                    image = reader.acquireLatestImage();
+                    if (image == null || closed) return;
+
+                    int rotDeg = computeJpegOrientation(chars, getDisplayRotationDegrees());
+                    boolean swapped = rotDeg == 90 || rotDeg == 270;
+                    int outW = swapped ? image.getHeight() : image.getWidth();
+                    int outH = swapped ? image.getWidth() : image.getHeight();
+
+                    Image.Plane[] planes = image.getPlanes();
+                    srcYBuf = copyPlaneToByteArray(planes[0].getBuffer(), srcYBuf);
+                    srcUBuf = copyPlaneToByteArray(planes[1].getBuffer(), srcUBuf);
+                    srcVBuf = copyPlaneToByteArray(planes[2].getBuffer(), srcVBuf);
+
+                    nv21Buffer = yuv420ArraysToRotatedNv21(
+                        image.getWidth(),
+                        image.getHeight(),
+                        srcYBuf,
+                        planes[0].getRowStride(),
+                        planes[0].getPixelStride(),
+                        srcUBuf,
+                        planes[1].getRowStride(),
+                        planes[1].getPixelStride(),
+                        srcVBuf,
+                        planes[2].getRowStride(),
+                        planes[2].getPixelStride(),
+                        rotDeg,
+                        nv21Buffer
+                    );
+
+                    jpegBaos.reset();
+                    YuvImage yuvImage = new YuvImage(nv21Buffer, ImageFormat.NV21, outW, outH, null);
+                    yuvImage.compressToJpeg(new Rect(0, 0, outW, outH), 78, jpegBaos);
+                    byte[] encoded = jpegBaos.toByteArray();
+
+                    synchronized (frameMonitor) {
+                        latestJpeg = encoded;
+                        frameSeq++;
+                        frameMonitor.notifyAll();
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (image != null) {
+                        try {
+                            image.close();
+                        } catch (Exception ignored) {}
+                    }
+                }
+            }
+        }
+
+        private void runAcceptLoop() {
+            while (!closed && serverSocket != null && !serverSocket.isClosed()) {
+                try {
+                    Socket client = serverSocket.accept();
+                    if (closed) {
+                        client.close();
+                        break;
+                    }
+                    client.setTcpNoDelay(true);
+                    clientSockets.add(client);
+                    Thread writer = new Thread(() -> serveClient(client), "MonoLensMjpegClient");
+                    writer.setDaemon(true);
+                    writer.start();
+                } catch (Exception e) {
+                    break;
+                }
+            }
+        }
+
+        private void serveClient(Socket client) {
+            try {
+                InputStream rawIn = new BufferedInputStream(client.getInputStream());
+                StringBuilder reqHeaders = new StringBuilder();
+                int prev = -1;
+                int b;
+                int headerBytes = 0;
+                while ((b = rawIn.read()) != -1 && headerBytes < 4096) {
+                    reqHeaders.append((char) b);
+                    headerBytes++;
+                    if (reqHeaders.length() >= 4 && reqHeaders.substring(reqHeaders.length() - 4).equals("\r\n\r\n")) {
+                        break;
+                    }
+                    if (prev == '\n' && b == '\n') {
+                        break;
+                    }
+                    prev = b;
+                }
+
+                OutputStream out = client.getOutputStream();
+                byte[] httpHeader = (
+                    "HTTP/1.1 200 OK\r\n"
+                        + "Connection: close\r\n"
+                        + "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+                        + "Pragma: no-cache\r\n"
+                        + "Access-Control-Allow-Origin: *\r\n"
+                        + "Content-Type: multipart/x-mixed-replace; boundary=monolensframe\r\n\r\n"
+                ).getBytes(StandardCharsets.US_ASCII);
+                out.write(httpHeader);
+                out.flush();
+
+                long lastSentSeq = 0L;
+                while (!closed && !client.isClosed()) {
+                    byte[] frameBytes;
+                    synchronized (frameMonitor) {
+                        while (!closed && frameSeq == lastSentSeq) {
+                            frameMonitor.wait(500);
+                        }
+                        if (closed) break;
+                        frameBytes = latestJpeg;
+                        lastSentSeq = frameSeq;
+                    }
+                    if (frameBytes == null || frameBytes.length == 0) continue;
+
+                    byte[] partHeader = (
+                        "--monolensframe\r\n"
+                            + "Content-Type: image/jpeg\r\n"
+                            + "Content-Length: " + frameBytes.length + "\r\n\r\n"
+                    ).getBytes(StandardCharsets.US_ASCII);
+                    out.write(partHeader);
+                    out.write(frameBytes);
+                    out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+                    out.flush();
+                }
+            } catch (Exception ignored) {
+            } finally {
+                clientSockets.remove(client);
+                try {
+                    client.close();
+                } catch (Exception ignored) {}
+            }
+        }
+
+        void close() {
+            closed = true;
+            synchronized (frameMonitor) {
+                frameMonitor.notifyAll();
+            }
+            for (Socket client : clientSockets) {
+                try {
+                    client.close();
+                } catch (Exception ignored) {}
+            }
+            clientSockets.clear();
+            try {
+                if (serverSocket != null) serverSocket.close();
+            } catch (Exception ignored) {}
+            try {
+                if (captureSession != null) captureSession.close();
+            } catch (Exception ignored) {}
+            try {
+                if (cameraDevice != null) cameraDevice.close();
+            } catch (Exception ignored) {}
+            synchronized (frameEncodeLock) {
+                try {
+                    if (yuvReader != null) yuvReader.close();
+                } catch (Exception ignored) {}
+                yuvReader = null;
+            }
+            try {
+                if (readerThread != null) readerThread.quitSafely();
+            } catch (Exception ignored) {}
+            try {
+                if (handlerThread != null) handlerThread.quitSafely();
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private static byte[] copyPlaneToByteArray(ByteBuffer buf, byte[] reuse) {
+        buf.rewind();
+        int rem = buf.remaining();
+        byte[] arr = (reuse != null && reuse.length >= rem) ? reuse : new byte[rem];
+        buf.get(arr, 0, rem);
+        return arr;
+    }
+
+    private static byte[] yuv420ArraysToRotatedNv21(
+        int srcW,
+        int srcH,
+        byte[] srcY,
+        int yRowStride,
+        int yPixStride,
+        byte[] srcU,
+        int uRowStride,
+        int uPixStride,
+        byte[] srcV,
+        int vRowStride,
+        int vPixStride,
+        int rotDeg,
+        byte[] reuseBuf
+    ) {
+        boolean swap = (rotDeg == 90 || rotDeg == 270);
+        int outW = swap ? srcH : srcW;
+        int outH = swap ? srcW : srcH;
+        int ySize = outW * outH;
+        int totalSize = ySize + (ySize >> 1);
+        byte[] nv21 = (reuseBuf != null && reuseBuf.length == totalSize) ? reuseBuf : new byte[totalSize];
+
+        // Y plane
+        int dstIdx = 0;
+        if (rotDeg == 0) {
+            if (yPixStride == 1 && yRowStride == srcW) {
+                System.arraycopy(srcY, 0, nv21, 0, ySize);
+            } else {
+                for (int dy = 0; dy < outH; dy++) {
+                    int rowOff = dy * yRowStride;
+                    for (int dx = 0; dx < outW; dx++) {
+                        nv21[dstIdx++] = srcY[rowOff + dx * yPixStride];
+                    }
+                }
+            }
+        } else if (rotDeg == 90 && yPixStride == 1) {
+            int lastRowOff = (srcH - 1) * yRowStride;
+            for (int dy = 0; dy < outH; dy++) {
+                int pos = lastRowOff + dy;
+                for (int dx = 0; dx < outW; dx++) {
+                    nv21[dstIdx++] = srcY[pos];
+                    pos -= yRowStride;
+                }
+            }
+        } else if (rotDeg == 270 && yPixStride == 1) {
+            int lastCol = srcW - 1;
+            for (int dy = 0; dy < outH; dy++) {
+                int pos = lastCol - dy;
+                for (int dx = 0; dx < outW; dx++) {
+                    nv21[dstIdx++] = srcY[pos];
+                    pos += yRowStride;
+                }
+            }
+        } else {
+            for (int dy = 0; dy < outH; dy++) {
+                for (int dx = 0; dx < outW; dx++) {
+                    int sx;
+                    int sy;
+                    switch (rotDeg) {
+                        case 90:
+                            sx = dy;
+                            sy = srcH - 1 - dx;
+                            break;
+                        case 180:
+                            sx = srcW - 1 - dx;
+                            sy = srcH - 1 - dy;
+                            break;
+                        case 270:
+                            sx = srcW - 1 - dy;
+                            sy = dx;
+                            break;
+                        case 0:
+                        default:
+                            sx = dx;
+                            sy = dy;
+                            break;
+                    }
+                    nv21[dstIdx++] = srcY[sy * yRowStride + sx * yPixStride];
+                }
+            }
+        }
+
+        // UV planes (NV21 = interleaved V, U)
+        int srcHalfW = srcW >> 1;
+        int srcHalfH = srcH >> 1;
+        int outHalfW = outW >> 1;
+        int outHalfH = outH >> 1;
+        int uvIdx = ySize;
+
+        if (rotDeg == 90) {
+            int lastUvRow = srcHalfH - 1;
+            for (int uy = 0; uy < outHalfH; uy++) {
+                int vPos = lastUvRow * vRowStride + uy * vPixStride;
+                int uPos = lastUvRow * uRowStride + uy * uPixStride;
+                for (int ux = 0; ux < outHalfW; ux++) {
+                    nv21[uvIdx++] = srcV[vPos];
+                    nv21[uvIdx++] = srcU[uPos];
+                    vPos -= vRowStride;
+                    uPos -= uRowStride;
+                }
+            }
+        } else if (rotDeg == 270) {
+            int lastUvCol = srcHalfW - 1;
+            for (int uy = 0; uy < outHalfH; uy++) {
+                int col = lastUvCol - uy;
+                int vPos = col * vPixStride;
+                int uPos = col * uPixStride;
+                for (int ux = 0; ux < outHalfW; ux++) {
+                    nv21[uvIdx++] = srcV[vPos];
+                    nv21[uvIdx++] = srcU[uPos];
+                    vPos += vRowStride;
+                    uPos += uRowStride;
+                }
+            }
+        } else {
+            for (int uy = 0; uy < outHalfH; uy++) {
+                for (int ux = 0; ux < outHalfW; ux++) {
+                    int sux = (rotDeg == 180) ? (srcHalfW - 1 - ux) : ux;
+                    int suy = (rotDeg == 180) ? (srcHalfH - 1 - uy) : uy;
+                    nv21[uvIdx++] = srcV[suy * vRowStride + sux * vPixStride];
+                    nv21[uvIdx++] = srcU[suy * uRowStride + sux * uPixStride];
+                }
+            }
+        }
+        return nv21;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Range<Integer> selectPreviewFpsRange(CameraCharacteristics chars) {
+        Range<Integer>[] ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+        if (ranges == null || ranges.length == 0) return null;
+        Range<Integer> best = null;
+        int bestScore = Integer.MIN_VALUE;
+        for (Range<Integer> r : ranges) {
+            int lo = r.getLower();
+            int hi = r.getUpper();
+            if (hi > 30) continue;
+            // Prefer [30, 30] or [24, 30] / [15, 30]
+            int score = hi * 100 + lo;
+            if (score > bestScore) {
+                bestScore = score;
+                best = r;
+            }
+        }
+        return best;
+    }
+
+    private static Size selectPreviewSize(Size[] sizes) {
+        if (sizes == null || sizes.length == 0) return null;
+        final long targetArea = 800L * 600L;
+        Size best43 = null;
+        long best43Diff = Long.MAX_VALUE;
+        Size fallback = null;
+        long fallbackDiff = Long.MAX_VALUE;
+
+        for (Size s : sizes) {
+            int w = s.getWidth();
+            int h = s.getHeight();
+            if (w < 480 || h < 360 || w > 800 || h > 800) continue;
+            long area = (long) w * h;
+            long diff = Math.abs(area - targetArea);
+            double aspect = (double) w / Math.max(1, h);
+            if (Math.abs(aspect - (4.0 / 3.0)) < 0.08) {
+                if (diff < best43Diff) {
+                    best43 = s;
+                    best43Diff = diff;
+                }
+            }
+            if (diff < fallbackDiff) {
+                fallback = s;
+                fallbackDiff = diff;
+            }
+        }
+        if (best43 != null) return best43;
+        if (fallback != null) return fallback;
+        return sizes[sizes.length - 1];
     }
 
     private static void setIfSupported(
