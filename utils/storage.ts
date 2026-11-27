@@ -4,30 +4,41 @@ const DB_NAME = 'monolens_db';
 const STORE_NAME = 'images';
 const DB_VERSION = 1;
 
+let dbPromise: Promise<IDBDatabase> | null = null;
+
 /**
- * Open (or create) the IndexedDB database
+ * Open (or reuse) the IndexedDB database connection
  */
 const openDB = (): Promise<IDBDatabase> => {
-  return new Promise((resolve, reject) => {
+  if (dbPromise) return dbPromise;
+
+  dbPromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
 
     request.onerror = (event) => {
-      console.error("Database error:", (event.target as IDBOpenDBRequest).error);
-      reject((event.target as IDBOpenDBRequest).error);
+      dbPromise = null;
+      const err = (event.target as IDBOpenDBRequest).error;
+      console.error('Database error:', err);
+      reject(err);
     };
 
     request.onupgradeneeded = (event) => {
       const db = (event.target as IDBOpenDBRequest).result;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
-        // Create object store with 'id' as keyPath
         db.createObjectStore(STORE_NAME, { keyPath: 'id' });
       }
     };
 
     request.onsuccess = (event) => {
-      resolve((event.target as IDBOpenDBRequest).result);
+      const db = (event.target as IDBOpenDBRequest).result;
+      db.onclose = () => {
+        dbPromise = null;
+      };
+      resolve(db);
     };
   });
+
+  return dbPromise;
 };
 
 /**
@@ -84,5 +95,22 @@ export const deleteImageFromDB = async (id: string): Promise<void> => {
 
     request.onsuccess = () => resolve();
     request.onerror = () => reject(request.error);
+  });
+};
+
+/**
+ * Delete multiple images by ID in a single transaction
+ */
+export const deleteImagesFromDB = async (ids: string[]): Promise<void> => {
+  if (ids.length === 0) return;
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    for (const id of ids) {
+      store.delete(id);
+    }
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
   });
 };

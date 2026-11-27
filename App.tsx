@@ -3,7 +3,8 @@ import React, { useState, useEffect } from 'react';
 import CameraInterface from './components/CameraInterface';
 import Gallery from './components/Gallery';
 import { CapturedImage } from './types';
-import { initDB, loadImagesFromDB, saveImageToDB, deleteImageFromDB } from './utils/storage';
+import { initDB, loadImagesFromDB, saveImageToDB, deleteImageFromDB, deleteImagesFromDB } from './utils/storage';
+import { I18nProvider } from './utils/i18n';
 import { App as CapApp } from '@capacitor/app';
 import { StatusBar, Style } from '@capacitor/status-bar';
 
@@ -12,33 +13,47 @@ const App: React.FC = () => {
   const [capturedImages, setCapturedImages] = useState<CapturedImage[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
+  const viewRef = React.useRef(view);
+  viewRef.current = view;
+
   // Android Lifecycle and Native Integration
   useEffect(() => {
+    let isCancelled = false;
+    let backHandle: { remove: () => Promise<void> } | null = null;
+
     const setupNative = async () => {
       try {
-        // Hide/Style StatusBar for Camera Experience
         await StatusBar.setStyle({ style: Style.Dark });
         await StatusBar.setOverlaysWebView({ overlay: true });
-      } catch (e) {
-        console.warn("Native StatusBar not available");
+      } catch {
+        // Native StatusBar not available on web
       }
 
-      // Handle Android Back Button
-      const backListener = await CapApp.addListener('backButton', () => {
-        if (view === 'gallery') {
-          setView('camera');
+      try {
+        const handle = await CapApp.addListener('backButton', () => {
+          if (viewRef.current === 'gallery') {
+            setView('camera');
+          } else {
+            CapApp.exitApp();
+          }
+        });
+        if (isCancelled) {
+          handle.remove();
         } else {
-          CapApp.exitApp();
+          backHandle = handle;
         }
-      });
-
-      return () => {
-        backListener.remove();
-      };
+      } catch {
+        // Native App plugin not available on web
+      }
     };
 
     setupNative();
-  }, [view]);
+
+    return () => {
+      isCancelled = true;
+      backHandle?.remove();
+    };
+  }, []);
 
   // Load images on startup
   useEffect(() => {
@@ -74,6 +89,17 @@ const App: React.FC = () => {
     }
   };
 
+  const handleDeleteMany = async (ids: string[]) => {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
+    setCapturedImages(prev => prev.filter(img => !idSet.has(img.id)));
+    try {
+      await deleteImagesFromDB(ids);
+    } catch (error) {
+      console.error("Failed to delete images from DB:", error);
+    }
+  };
+
   if (isLoading) {
     return (
       <div className="w-full h-screen bg-black flex items-center justify-center text-white">
@@ -83,21 +109,25 @@ const App: React.FC = () => {
   }
 
   return (
-    <div className="w-full h-screen bg-black overflow-hidden flex flex-col">
-      {view === 'camera' ? (
-        <CameraInterface 
-          onGalleryClick={() => setView('gallery')}
-          onCapture={handleCapture}
-          lastImage={capturedImages[0]}
-        />
-      ) : (
-        <Gallery 
-          images={capturedImages} 
-          onBack={() => setView('camera')}
-          onDelete={handleDelete}
-        />
-      )}
-    </div>
+    <I18nProvider>
+      <div className="w-full h-screen bg-black overflow-hidden flex flex-col">
+        {view === 'camera' ? (
+          <CameraInterface 
+            onGalleryClick={() => setView('gallery')}
+            onCapture={handleCapture}
+            lastImage={capturedImages[0]}
+          />
+        ) : (
+          <Gallery 
+            images={capturedImages} 
+            onBack={() => setView('camera')}
+            onDelete={handleDelete}
+            onDeleteMany={handleDeleteMany}
+            onSaveCopy={handleCapture}
+          />
+        )}
+      </div>
+    </I18nProvider>
   );
 };
 
