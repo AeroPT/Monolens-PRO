@@ -1,0 +1,8 @@
+{
+  "name": "MonoLens Pro V3",
+  "description": "Câmera monocromática profissional com pipeline de processamento em tempo real, curvas de tom e suporte a múltiplas lentes.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": []
+}

@@ -1,133 +1,27 @@
-
 <!DOCTYPE html>
 <html lang="pt-BR">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
     <meta name="theme-color" content="#000000" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <!-- Impede que o Android escale a UI baseado em configurações de acessibilidade de fonte -->
-    <meta name="format-detection" content="telephone=no">
-    <meta name="msapplication-tap-highlight" content="no">
-    <title>MonoLens Pro</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-      tailwind.config = {
-        theme: {
-          extend: {
-            colors: {
-              mono: {
-                900: '#050505',
-                800: '#121212',
-                700: '#1f1f1f',
-                600: '#333333',
-                500: '#555555',
-                400: '#888888',
-                300: '#aaaaaa',
-                100: '#e5e5e5',
-                50: '#f5f5f5',
-              },
-              accent: '#ff3b30'
-            },
-            fontFamily: {
-              sans: ['Inter', 'sans-serif'],
-              mono: ['Fira Code', 'monospace'],
-            },
-          },
-        },
-      }
-    </script>
-    <style>
-      :root {
-        --safe-area-top: env(safe-area-inset-top, 0px);
-        --safe-area-bottom: env(safe-area-inset-bottom, 0px);
-      }
-      html {
-        /* Bloqueia o redimensionamento de texto do sistema Android */
-        -webkit-text-size-adjust: none;
-        text-size-adjust: none;
-      }
-      body {
-        background-color: #000;
-        color: #fff;
-        overscroll-behavior: none;
-        -webkit-tap-highlight-color: transparent;
-        user-select: none;
-        -webkit-user-select: none;
-        overflow: hidden;
-        height: 100vh;
-        height: -webkit-fill-available;
-      }
-      * {
-        -webkit-touch-callout: none;
-        -webkit-user-select: none;
-        user-select: none;
-        outline: none;
-        -webkit-tap-highlight-color: transparent;
-      }
-      input[type="range"] {
-        -webkit-appearance: none;
-        background: transparent;
-      }
-      .range-thumb-style::-webkit-slider-thumb {
-        -webkit-appearance: none;
-        appearance: none;
-        width: 20px; /* Reduzido de 24px */
-        height: 20px;
-        background: white;
-        border-radius: 50%;
-        cursor: pointer;
-        border: 2px solid #000;
-        box-shadow: 0 0 10px rgba(0,0,0,0.6);
-      }
-      .range-vertical-focus {
-        -webkit-appearance: none;
-        width: 30vh;
-        height: 4px;
-        background: rgba(255, 255, 255, 0.15);
-        border-radius: 2px;
-        transform: rotate(-90deg);
-        outline: none;
-        margin: 0;
-        padding: 0;
-      }
-      .range-vertical-focus::-webkit-slider-thumb {
-        -webkit-appearance: none;
-        width: 28px; /* Reduzido de 32px */
-        height: 28px;
-        background: #fff;
-        border: 4px solid #facc15;
-        border-radius: 50%;
-        box-shadow: 0 0 15px rgba(0,0,0,0.7);
-      }
-      video::-webkit-media-controls { display:none !important; }
-      video { background-color: black !important; }
-      .no-scrollbar::-webkit-scrollbar { display: none; }
-      .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-      
-      .safe-top { padding-top: var(--safe-area-top); }
-      .safe-bottom { padding-bottom: var(--safe-area-bottom); }
-    </style>
-  <script type="importmap">
-{
-  "imports": {
-    "react": "https://esm.sh/react@^19.2.3",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
-    "react/": "https://esm.sh/react@^19.2.3/",
-    "lucide-react": "https://esm.sh/lucide-react@^0.562.0",
-    "vite": "https://esm.sh/vite@^7.3.1",
-    "@vitejs/plugin-react": "https://esm.sh/@vitejs/plugin-react@^5.1.2",
-    "@capacitor/core": "https://esm.sh/@capacitor/core@^6.0.0",
-    "@capacitor/app": "https://esm.sh/@capacitor/app@^6.0.0",
-    "@capacitor/haptics": "https://esm.sh/@capacitor/haptics@^6.0.0",
-    "@capacitor/status-bar": "https://esm.sh/@capacitor/status-bar@^6.0.0",
-    "@capacitor/filesystem": "https://esm.sh/@capacitor/filesystem@^8.0.0"
-  }
-}
-</script>
-<link rel="stylesheet" href="/index.css">
-</head>
+    <meta name="format-detection" content="telephone=no" />
+    <meta name="msapplication-tap-highlight" content="no" />
+    <title>MonoLens Pro V3</title>
+    <meta
+      name="description"
+      content="Câmera monocromática profissional com pipeline de processamento em tempo real, curvas de tom e suporte a múltiplas lentes."
+    />
+    <meta property="og:title" content="MonoLens Pro V3" />
+    <meta
+      property="og:description"
+      content="Câmera monocromática profissional com pipeline de processamento em tempo real, curvas de tom e suporte a múltiplas lentes."
+    />
+  </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/index.tsx"></script>

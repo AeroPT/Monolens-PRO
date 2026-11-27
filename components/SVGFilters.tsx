@@ -1,17 +1,23 @@
-import React, { useMemo } from 'react';
+import React, { memo, useMemo } from 'react';
 import { FilterSettings } from '../types';
 import { getCurveLut } from '../utils/curveMath';
+import { getBwChannelWeights } from '../utils/bwFilters';
 
 interface SVGFiltersProps {
   settings: FilterSettings;
 }
 
 const SVGFilters: React.FC<SVGFiltersProps> = ({ settings }) => {
-  const { blackPoint, whitePoint, midTone, contrast, outputBlack, outputWhite, curvePoints } = settings;
+  const { blackPoint, whitePoint, midTone, contrast, outputBlack, outputWhite, curvePoints, colorFilter } = settings;
+  const exposureGain = settings.exposureGain ?? 1.0;
+
+  const [wr, wg, wb] = getBwChannelWeights(colorFilter);
+  const channelMatrix = `${wr} ${wg} ${wb} 0 0\n${wr} ${wg} ${wb} 0 0\n${wr} ${wg} ${wb} 0 0\n0 0 0 1 0`;
 
   // Calculate Linear Slope and Intercept for Input Levels
-  const range = (whitePoint - blackPoint) / 255;
-  const slope = range === 0 ? 1 : 1 / range;
+  const safeSpan = Math.max(1, whitePoint - blackPoint);
+  const range = safeSpan / 255;
+  const slope = 1 / range;
   const intercept = -(blackPoint / 255) * slope;
 
   // Calculate Linear Slope and Intercept for Contrast
@@ -25,25 +31,29 @@ const SVGFilters: React.FC<SVGFiltersProps> = ({ settings }) => {
   // Generate Curve LUT String for SVG "tableValues"
   const curveTableValues = useMemo(() => {
     const lut = getCurveLut(curvePoints);
-    return lut.join(' ');
+    return lut.map(v => v.toFixed(4)).join(' ');
   }, [curvePoints]);
 
   return (
     <svg className="absolute w-0 h-0 overflow-hidden" aria-hidden="true">
       <defs>
         <filter id="mono-pro-filter" colorInterpolationFilters="sRGB">
-          {/* 1. Desaturate to Grayscale */}
+          {/* 1. Optical Channel Desaturate to Grayscale */}
           <feColorMatrix
             type="matrix"
-            values="0.2126 0.7152 0.0722 0 0
-                    0.2126 0.7152 0.0722 0 0
-                    0.2126 0.7152 0.0722 0 0
-                    0      0      0      1 0"
+            values={channelMatrix}
             result="gray"
           />
 
+          {/* 1b. Exposure Gain (when software fallback is active) */}
+          <feComponentTransfer in="gray" result="exposed">
+            <feFuncR type="linear" slope={exposureGain} intercept={0} />
+            <feFuncG type="linear" slope={exposureGain} intercept={0} />
+            <feFuncB type="linear" slope={exposureGain} intercept={0} />
+          </feComponentTransfer>
+
           {/* 2. Apply Input Levels (Black/White point) */}
-          <feComponentTransfer in="gray" result="levels_input">
+          <feComponentTransfer in="exposed" result="levels_input">
             <feFuncR type="linear" slope={slope} intercept={intercept} />
             <feFuncG type="linear" slope={slope} intercept={intercept} />
             <feFuncB type="linear" slope={slope} intercept={intercept} />
@@ -82,4 +92,4 @@ const SVGFilters: React.FC<SVGFiltersProps> = ({ settings }) => {
   );
 };
 
-export default SVGFilters;
+export default memo(SVGFilters);
