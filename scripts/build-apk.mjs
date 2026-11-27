@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const isWin = process.platform === 'win32';
-const shouldPublishRelease = process.argv.includes('--release');
 const androidDir = path.resolve(process.cwd(), 'android');
 
 if (!fs.existsSync(androidDir)) {
@@ -62,42 +61,6 @@ const apkPath = path.join(
   'debug',
   'app-debug.apk'
 );
-
-if (!fs.existsSync(apkPath)) {
-  console.error('Erro: app-debug.apk nao encontrado apos a compilacao.');
-  process.exit(1);
-}
-
-console.log(`\nAPK gerado com sucesso em:\n${apkPath}\n`);
-
-if (shouldPublishRelease) {
-  const pkgPath = path.resolve(process.cwd(), 'package.json');
-  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-  const tag = `v${pkg.version}`;
-  const assetArg = `${apkPath}#monolens-pro-${tag}-debug.apk`;
-
-  console.log(`A publicar release ${tag} no GitHub...`);
-
-  const ghResult = spawnSync(
-    'gh',
-    [
-      'release',
-      'create',
-      tag,
-      assetArg,
-      '--title',
-      `MonoLens Pro ${tag}`,
-      '--generate-notes',
-    ],
-    {
-      stdio: 'inherit',
-    }
-  );
-
-  if (ghResult.status !== 0) {
-    console.error('Falha ao criar a release no GitHub. Verifica se a tag ja existe ou se o gh esta autenticado.');
-    process.exit(ghResult.status ?? 1);
-  }
-
-  console.log(`\nRelease ${tag} publicada com sucesso no GitHub!\n`);
+if (fs.existsSync(apkPath)) {
+  console.log(`\nAPK gerado com sucesso em:\n${apkPath}\n`);
 }

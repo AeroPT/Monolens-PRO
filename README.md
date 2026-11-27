@@ -10,8 +10,9 @@
 
 ### Capture Modes & Native Camera2 Engine
 - **Fast (2.8 MP):** Zero-shutter-lag capture (`1920×1440`) matching the live viewfinder with maximum focus peaking and histogram smoothness.
-- **4K Stream (8–12 MP):** High-resolution stream capture (`4032×3024` / `3840×2160`) with synchronous freeze-frame preview during processing.
+- **4K Stream (8–12 MP):** High-resolution stream capture (`4032×3024` / `3840×2160`) holding a synchronous freeze-frame of the viewfinder during processing for a flash-free shutter transition.
 - **Max Sensor (Camera2 Native — Android):** Direct native `Camera2` still capture (`ProCapturePlugin.java`) at full sensor resolution (up to 12.5 MP) with spot AF metering, high-quality noise reduction, and **real Bayer RAW (`.dng`)** output alongside B&W JPEG.
+- **Ultra-Wide (`0.7×`) Native Live Preview (Android):** On devices where WebView/WebRTC restricts zoom to `≥ 1×` (such as Pixel logical multi-camera setups), zooming below `0.95×` seamlessly switches to a low-latency localhost Camera2 `YUV_420_888` → MJPEG live preview stream (`127.0.0.1`) with dedicated background encoding, block-copied YUV rotation, and 30 fps AE targeting—preserving real-time B&W SVG filters, peaking, zebras, histogram, and tap-to-focus.
 - **B&W + RAW / DNG Dual Capture:** Optionally store an unfiltered original / Adobe DNG alongside each processed monochrome frame for later re-editing or external RAW workflows.
 
 ### Optical Monochrome & Film Engine
@@ -33,7 +34,7 @@
 - **High-Performance Gallery:** IndexedDB persistence, pinch-to-zoom / pan viewer, swipe navigation, B&W vs. Original/DNG toggle, image metadata inspector, and long-press multi-select batch deletion.
 - **Non-Destructive Re-Editor:** Adjust filters, curves, levels, grain, and vignette on captured photos and save edited copies without overwriting originals.
 - **Native Android Export (`MediaSaverPlugin`):** Saves B&W JPEGs and `.dng` RAW files directly to `Pictures/MonoLensPro` via Android `MediaStore`.
-- **Open Directly in Snapseed:** One-tap **Snapseed** button in the photo viewer launches Snapseed (`com.niksoftware.snapseed`) via `FileProvider` with the currently viewed B&W JPEG or RAW `.dng`.
+- **Smart Snapseed Handoff:** Tapping the **Snapseed** icon in the gallery viewer opens the B&W JPEG directly in Snapseed (`com.niksoftware.snapseed`) via `FileProvider`, or—when a **RAW `.dng`** file is also attached to the capture—prompts you to choose between opening the **RAW (`.dng`)** or the **B&W (`.jpg`)**.
 
 ---
 
@@ -99,45 +100,49 @@ monolens-pro/
 ├── android/
 │   └── app/src/main/
 │       ├── AndroidManifest.xml
-│       ├── res/xml/file_paths.xml
+│       ├── res/xml/
+│       │   ├── config.xml
+│       │   ├── file_paths.xml               # FileProvider paths for Snapseed export
+│       │   └── network_security_config.xml  # Localhost-only cleartext for MJPEG preview
 │       └── java/com/monolens/pro/
-│           ├── MainActivity.java        # Capacitor plugin registration
-│           ├── ProCapturePlugin.java    # Native Camera2 full-sensor + Bayer DNG capture
-│           └── MediaSaverPlugin.java    # MediaStore export & Snapseed FileProvider launcher
+│           ├── MainActivity.java            # Capacitor plugin registration & WebView config
+│           ├── ProCapturePlugin.java        # Native Camera2 capture, Bayer DNG & Ultra-Wide MJPEG stream
+│           └── MediaSaverPlugin.java        # MediaStore export & Snapseed FileProvider launcher
 ├── components/
-│   ├── AssistOverlay.tsx                # Live Focus Peaking & Highlight Zebras
-│   ├── CameraInterface.tsx              # Main viewfinder, HUD, capture & controls drawer
-│   ├── CaptureModeMenu.tsx              # Fast / 4K Stream / Max Sensor selector
-│   ├── CurvesControl.tsx                # Interactive spline tone curve & histogram
-│   ├── ExposureControl.tsx              # Auto EV & Manual Shutter/ISO controls
-│   ├── FilmControl.tsx                  # Optical B&W filters, film recipes, grain & vignette
-│   ├── FocusReticle.tsx                 # Pixel-style tap/tracking AF reticle
-│   ├── FramingGrid.tsx                  # 3x3, 4x4, Phi, Diagonals overlays
-│   ├── Gallery.tsx                      # Photo grid, viewer, batch delete, export & Snapseed
-│   ├── GalleryEditor.tsx                # Non-destructive gallery re-editing sheet
-│   ├── Histogram.tsx                    # Real-time luminance histogram
-│   ├── HorizontalLevel.tsx              # Gyroscope spirit level
-│   ├── PeakSettingsMenu.tsx             # Peaking color & intensity popover
-│   ├── SVGFilters.tsx                   # Hardware-accelerated SVG monochrome pipeline
-│   ├── SliderControl.tsx                # Tactile parameter slider
-│   └── ZoomableImageView.tsx            # Pinch-to-zoom & pan gallery viewer
+│   ├── AssistOverlay.tsx                    # Live Focus Peaking & Highlight Zebras
+│   ├── CameraInterface.tsx                  # Main viewfinder (WebRTC + native MJPEG), HUD & controls
+│   ├── CaptureModeMenu.tsx                  # Fast / 4K Stream / Max Sensor selector
+│   ├── CurvesControl.tsx                    # Interactive spline tone curve & histogram
+│   ├── ExposureControl.tsx                  # Auto EV & Manual Shutter/ISO controls
+│   ├── FilmControl.tsx                      # Optical B&W filters, film recipes, grain & vignette
+│   ├── FocusReticle.tsx                     # Pixel-style tap/tracking AF reticle
+│   ├── FramingGrid.tsx                      # 3x3, 4x4, Phi, Diagonals overlays
+│   ├── Gallery.tsx                          # Photo grid, viewer, batch delete, export & Snapseed chooser
+│   ├── GalleryEditor.tsx                    # Non-destructive gallery re-editing sheet
+│   ├── Histogram.tsx                        # Real-time luminance histogram
+│   ├── HorizontalLevel.tsx                  # Gyroscope spirit level
+│   ├── PeakSettingsMenu.tsx                 # Peaking color & intensity popover
+│   ├── SVGFilters.tsx                       # Hardware-accelerated SVG monochrome pipeline
+│   ├── SliderControl.tsx                    # Tactile parameter slider
+│   └── ZoomableImageView.tsx                # Pinch-to-zoom & pan gallery viewer
 ├── hooks/
-│   └── useCamera.ts                     # WebRTC MediaStream, multi-lens, AF, zoom & exposure
+│   └── useCamera.ts                         # WebRTC MediaStream, multi-lens, zoom range, AF & exposure
 ├── scripts/
-│   └── build-apk.mjs                    # Cross-platform Gradle debug APK build helper
+│   └── build-apk.mjs                        # Cross-platform Gradle debug APK build helper
 ├── utils/
-│   ├── bwFilters.ts                     # Optical B&W channel weights & built-in film recipes
-│   ├── cameraPrefs.ts                   # Persistent camera preferences (localStorage)
-│   ├── contrastAutofocus.ts             # Software contrast AF sweep
-│   ├── curveMath.ts                     # Monotone cubic spline LUT generator
-│   ├── dngEncoder.ts                    # Adobe DNG encoder & Base64 helpers
-│   ├── i18n.tsx                         # PT / EN localization context & dictionary
-│   ├── imageProcessing.ts               # 12-bit LUT, grain, vignette & thumbnail processing
-│   ├── mediaSave.ts                     # MediaStore saver & Snapseed launcher bridge
-│   ├── objectTracker.ts                 # Live viewfinder visual AF target tracker
-│   ├── proCapture.ts                    # JS bridge for native Camera2 ProCapturePlugin
-│   ├── storage.ts                       # IndexedDB gallery storage
-│   └── useDoubleTap.ts                  # Double-tap reset gesture hook
+│   ├── bwFilters.ts                         # Optical B&W channel weights & built-in film recipes
+│   ├── cameraPrefs.ts                       # Persistent camera preferences (localStorage)
+│   ├── contrastAutofocus.ts                 # Software contrast AF sweep
+│   ├── curveMath.ts                         # Monotone cubic spline LUT generator
+│   ├── dngEncoder.ts                        # Adobe DNG encoder & Base64 helpers
+│   ├── i18n.tsx                             # PT / EN localization context & dictionary
+│   ├── imageProcessing.ts                   # 12-bit LUT, grain, vignette & thumbnail processing
+│   ├── mediaSave.ts                         # MediaStore saver & Snapseed launcher bridge
+│   ├── objectTracker.ts                     # Live viewfinder visual AF target tracker
+│   ├── previewMedia.ts                      # Unified HTMLVideoElement / HTMLImageElement preview helpers
+│   ├── proCapture.ts                        # JS bridge for native Camera2 ProCapturePlugin
+│   ├── storage.ts                           # IndexedDB gallery storage
+│   └── useDoubleTap.ts                      # Double-tap reset gesture hook
 ├── App.tsx
 ├── index.tsx
 ├── index.css
