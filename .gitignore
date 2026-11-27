@@ -42,3 +42,4 @@ android/local.properties
 __pycache__/
 *.py[cod]
 sync.ps1
+public/assets/aistudio/
